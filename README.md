@@ -125,10 +125,4 @@ emoji-remover-z/
 
 ## 📄 License
 
-MIT License — free to use, modify, and distribute.
-
----
-
-<p align="center">
-  Feito pelo Usuário Ium101 do GitHub &nbsp;/&nbsp; Made by User Ium101 from GitHub
-</p>
+BSD-2-Clause license
