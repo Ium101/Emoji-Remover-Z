@@ -127,38 +127,27 @@ _EXTRA_STRIP_RANGES = [
     (0x2190, 0x21FF),  # Arrows
     (0x2200, 0x22FF),  # Mathematical Operators
     (0x2300, 0x23FF),  # Miscellaneous Technical (already in emoji ranges)
-    (0x2400, 0x24FF),  # Enclosed Alphanumerics
     (0x2500, 0x257F),  # Box Drawing
     (0x2580, 0x259F),  # Block Elements
     (0x25A0, 0x25FF),  # Geometric Shapes
-    (0x2600, 0x26FF),  # Miscellaneous Symbols (already in emoji ranges)
-    (0x2700, 0x27BF),  # Dingbats (already in emoji ranges)
     (0x2900, 0x297F),  # Supplemental Arrows
     (0x2B00, 0x2BFF),  # Miscellaneous Symbols and Arrows
-    (0x0950, 0x097F),  # Devanagari diacritics and combining marks
-    (0xA8E0, 0xA8FF),  # Devanagari extended
 ]
 
 # Special decorative characters that need to be stripped
 _SPECIAL_CHARS_TO_STRIP = frozenset([
-    # Various decorative marks and brackets
-    '✩', '✧', '⋄', '⋆', '⋅', '☾', '✺', '◟', '◞', '⋒', '❉', '°', '✾',
-    # Hearts and symbols
-    '♡', '♥', '🖤', '💜', '💀', '☑',
-    # Boxes and panels
-    '┌', '─', '┐', '┊', '┘', '╚', '═', '╝', '╔', '╝', '░', '▒',
-    # Decorative dots and dashes
-    '•', '°', '¸', '♪', '♫', '彡', '゜', '⌣', '⍤', '◡', 'ↄ', 'ᆽ',
-    # Marks and kasida
-    'ė', 'ĕ', 'ᗢ', 'ෙ', 'ე', 'ේ', '꒱', '꒰', 'ა', '༝', 'ꔫ',
-    # Arrows and pointing marks
-    '➛', '➳', '➤', '→', '✿', '©', '㇁', 'つ', 'ゝ',
-    # Other special marks
-    '╳', '︶', '︵', '︷', '︸', '｟', '｠', '┈', '𖥺',
+    # Most problematic decorative marks from user examples
+    '✩', '✧', '⋆', '☾', '✺', '❉', '✾',
+    '♡', '♥', '💀',  # Hearts and skull
+    '┌', '┐', '┘', '└', '╚', '╔', '╝', '║', '═', '╳',  # Box drawing
+    '●', '○', '◟', '◞', '☑',  # Circles and checkboxes
 ])
 
 def _is_extra_strip(char: str) -> bool:
     cp = ord(char)
+    # Preserve CJK characters (Chinese, Japanese Kanji)
+    if (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or (0xF900 <= cp <= 0xFAFF):
+        return False
     for start, end in _EXTRA_STRIP_RANGES:
         if start <= cp <= end:
             return True
@@ -170,10 +159,31 @@ def sanitize_for_filesystem(name: str) -> tuple[str, bool]:
     Remove characters that are forbidden or problematic in filenames.
     Only reports was_changed=True if a character was actually removed/replaced.
     Does NOT normalise whitespace unless a removal created adjacent spaces.
+    Invisible characters are removed silently without marking as changed.
     """
+    # Invisible characters that should be removed silently
+    _INVISIBLE_CHARS = frozenset([
+        '\ufe0e', '\ufe0f',  # text/emoji variation selectors
+        '\u200d', '\u200c', '\u200b',  # ZWJ, ZWNJ, zero-width space
+    ])
+    
+    # Whitelist for dash/hyphen variants and other characters we want to keep
+    _DASH_WHITELIST = frozenset([
+        '-',           # U+002D HYPHEN-MINUS (regular hyphen)
+        '\u2010',      # HYPHEN
+        '\u2011',      # NON-BREAKING HYPHEN
+        '\u2012',      # FIGURE DASH
+        '\u2013',      # EN DASH
+        '\u2014',      # EM DASH
+        '\u2026',      # HORIZONTAL ELLIPSIS (...)
+    ])
+    
     result = []
     actually_changed = False
     for c in name:
+        # Remove invisible characters silently (don't mark as changed)
+        if c in _INVISIBLE_CHARS:
+            continue
         if c in _WIN_FORBIDDEN:
             result.append(' ')
             actually_changed = True
@@ -182,10 +192,13 @@ def sanitize_for_filesystem(name: str) -> tuple[str, bool]:
         if cp < 32:
             actually_changed = True
             continue
+        if c in _DASH_WHITELIST:
+            result.append(c)
+            continue
         if c in _SPECIAL_CHARS_TO_STRIP:
             actually_changed = True
             continue
-        if _is_extra_strip(c) and not c.isalnum() and c not in ' _-()[]{}.,!@#%^&+=~`\'':
+        if _is_extra_strip(c) and not c.isalnum() and c not in ' _-()[]{}.,!@#%^&+=~`\':‐‑‒–—':
             actually_changed = True
             continue
         result.append(c)
@@ -243,7 +256,7 @@ def safe_rename(src_path: Path, new_stem: str, ext: str) -> str:
 
 # ── Folder scanner ─────────────────────────────────────────────────────────────
 
-def scan_folder(folder: str, recursive: bool,
+def scan_folder(folder: str, recursive: bool, rename_folders: bool,
                 cancel_event: threading.Event,
                 out_queue: queue.Queue) -> None:
     """
@@ -259,14 +272,15 @@ def scan_folder(folder: str, recursive: bool,
             if cancel_event.is_set():
                 out_queue.put(None)
                 return
-            # Collect folders first
-            for dname in dirs:
-                try:
-                    p = Path(dirpath) / dname
-                    all_items.append((p, 'folder'))
-                    out_queue.put(("__count__", len(all_items)))
-                except (PermissionError, OSError):
-                    continue
+            # Collect folders first (if enabled)
+            if rename_folders:
+                for dname in dirs:
+                    try:
+                        p = Path(dirpath) / dname
+                        all_items.append((p, 'folder'))
+                        out_queue.put(("__count__", len(all_items)))
+                    except (PermissionError, OSError):
+                        continue
             # Then collect files
             for fname in files:
                 try:
@@ -337,6 +351,7 @@ class App(tk.Tk):
 
         self.folder_var    = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=False)
+        self.rename_folders_var = tk.BooleanVar(value=True)
 
         # Scan state — all parallel lists indexed by row
         self._preview_data: list[tuple] = []   # (Path, old_stem, new_stem, ext, item_type)
@@ -419,6 +434,10 @@ class App(tk.Tk):
                         text="Include subfolders (recursive)",
                         variable=self.recursive_var,
                         style="TCheckbutton").pack(side="left")
+        ttk.Checkbutton(opt_row,
+                        text="Also rename folders",
+                        variable=self.rename_folders_var,
+                        style="TCheckbutton").pack(side="left", padx=(20, 0))
 
         # ── Action buttons ────────────────────────────────────────────────────
         btns = tk.Frame(self, bg=BG)
@@ -696,14 +715,14 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._scan_worker,
-            args=(folder, self.recursive_var.get()),
+            args=(folder, self.recursive_var.get(), self.rename_folders_var.get()),
             daemon=True
         ).start()
         self.after(self._POLL_MS, self._poll_scan_queue)
 
-    def _scan_worker(self, folder: str, recursive: bool):
+    def _scan_worker(self, folder: str, recursive: bool, rename_folders: bool):
         try:
-            scan_folder(folder, recursive, self._cancel_event, self._scan_queue)
+            scan_folder(folder, recursive, rename_folders, self._cancel_event, self._scan_queue)
         except Exception as e:
             self._scan_queue.put(("__error__", str(e)))
             self._scan_queue.put(None)
@@ -805,8 +824,8 @@ class App(tk.Tk):
     # ── Rename ─────────────────────────────────────────────────────────────────
 
     def _rename(self):
-        snapshot = [(p, old, new, ext)
-                    for (p, old, new, ext), checked
+        snapshot = [(p, old, new, ext, item_type)
+                    for (p, old, new, ext, item_type), checked
                     in zip(self._preview_data, self._checked)
                     if checked]
         if not snapshot:
