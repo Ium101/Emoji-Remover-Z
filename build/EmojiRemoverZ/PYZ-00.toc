@@ -1,4 +1,4 @@
-('W:\\Codes\\Emoji-Remover-Z\\build\\EmojiRemoverZ\\PYZ-00.pyz',
+('X:\\Codes\\Emoji-Remover-Z\\build\\EmojiRemoverZ\\PYZ-00.pyz',
  [('__future__',
    'C:\\Program Files\\Python314\\Lib\\__future__.py',
    'PYMODULE'),

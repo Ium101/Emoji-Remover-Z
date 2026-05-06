@@ -135,7 +135,27 @@ _EXTRA_STRIP_RANGES = [
     (0x2700, 0x27BF),  # Dingbats (already in emoji ranges)
     (0x2900, 0x297F),  # Supplemental Arrows
     (0x2B00, 0x2BFF),  # Miscellaneous Symbols and Arrows
+    (0x0950, 0x097F),  # Devanagari diacritics and combining marks
+    (0xA8E0, 0xA8FF),  # Devanagari extended
 ]
+
+# Special decorative characters that need to be stripped
+_SPECIAL_CHARS_TO_STRIP = frozenset([
+    # Various decorative marks and brackets
+    '✩', '✧', '⋄', '⋆', '⋅', '☾', '✺', '◟', '◞', '⋒', '❉', '°', '✾',
+    # Hearts and symbols
+    '♡', '♥', '🖤', '💜', '💀', '☑',
+    # Boxes and panels
+    '┌', '─', '┐', '┊', '┘', '╚', '═', '╝', '╔', '╝', '░', '▒',
+    # Decorative dots and dashes
+    '•', '°', '¸', '♪', '♫', '彡', '゜', '⌣', '⍤', '◡', 'ↄ', 'ᆽ',
+    # Marks and kasida
+    'ė', 'ĕ', 'ᗢ', 'ෙ', 'ე', 'ේ', '꒱', '꒰', 'ა', '༝', 'ꔫ',
+    # Arrows and pointing marks
+    '➛', '➳', '➤', '→', '✿', '©', '㇁', 'つ', 'ゝ',
+    # Other special marks
+    '╳', '︶', '︵', '︷', '︸', '｟', '｠', '┈', '𖥺',
+])
 
 def _is_extra_strip(char: str) -> bool:
     cp = ord(char)
@@ -160,6 +180,9 @@ def sanitize_for_filesystem(name: str) -> tuple[str, bool]:
             continue
         cp = ord(c)
         if cp < 32:
+            actually_changed = True
+            continue
+        if c in _SPECIAL_CHARS_TO_STRIP:
             actually_changed = True
             continue
         if _is_extra_strip(c) and not c.isalnum() and c not in ' _-()[]{}.,!@#%^&+=~`\'':
@@ -224,23 +247,32 @@ def scan_folder(folder: str, recursive: bool,
                 cancel_event: threading.Event,
                 out_queue: queue.Queue) -> None:
     """
-    Phase 1 — walk and collect all supported files, emitting __count__ per file.
+    Phase 1 — walk and collect all supported files and folders, emitting __count__ per item.
     Phase 2 — check each name, emitting __item__ (match) or __progress__ (no match).
     Ends with None sentinel.
     """
     root_path = Path(folder)
-    all_files: list[Path] = []
+    all_items: list[tuple[Path, str]] = []  # (path, 'file' or 'folder')
 
     try:
         for dirpath, dirs, files in os.walk(str(root_path)):
             if cancel_event.is_set():
                 out_queue.put(None)
                 return
+            # Collect folders first
+            for dname in dirs:
+                try:
+                    p = Path(dirpath) / dname
+                    all_items.append((p, 'folder'))
+                    out_queue.put(("__count__", len(all_items)))
+                except (PermissionError, OSError):
+                    continue
+            # Then collect files
             for fname in files:
                 try:
                     p = Path(dirpath) / fname
-                    all_files.append(p)
-                    out_queue.put(("__count__", len(all_files)))
+                    all_items.append((p, 'file'))
+                    out_queue.put(("__count__", len(all_items)))
                 except (PermissionError, OSError):
                     continue
             if not recursive:
@@ -248,16 +280,24 @@ def scan_folder(folder: str, recursive: bool,
     except (PermissionError, OSError):
         pass
 
-    total = len(all_files)
+    total = len(all_items)
     out_queue.put(("__total__", total))
 
-    for i, p in enumerate(all_files):
+    for i, (p, item_type) in enumerate(all_items):
         if cancel_event.is_set():
             break
         try:
-            cleaned, changed = clean_name(p.stem)
+            if item_type == 'folder':
+                cleaned, changed = clean_name(p.name)
+            else:
+                cleaned, changed = clean_name(p.stem)
+                cleaned_with_ext = (cleaned, p.suffix)
+            
             if changed:
-                out_queue.put(("__item__", (p, p.stem, cleaned, p.suffix), i + 1, total))
+                if item_type == 'folder':
+                    out_queue.put(("__item__", (p, p.name, cleaned, '', item_type), i + 1, total))
+                else:
+                    out_queue.put(("__item__", (p, p.stem, cleaned, p.suffix, item_type), i + 1, total))
             else:
                 out_queue.put(("__progress__", i + 1, total))
         except (PermissionError, OSError):
@@ -299,7 +339,7 @@ class App(tk.Tk):
         self.recursive_var = tk.BooleanVar(value=False)
 
         # Scan state — all parallel lists indexed by row
-        self._preview_data: list[tuple] = []   # (Path, old_stem, new_stem, ext)
+        self._preview_data: list[tuple] = []   # (Path, old_stem, new_stem, ext, item_type)
         self._row_ids:      list[str]   = []   # treeview iid
         self._checked:      list[bool]  = []   # True = will be renamed
 
@@ -349,7 +389,7 @@ class App(tk.Tk):
         tk.Label(hdr, text="✦ EMOJI REMOVER Z",
                  font=("Courier New", 18, "bold"),
                  bg=BG, fg=ACCENT).pack(side="left")
-        tk.Label(hdr, text="strip emojis & styled text from any filename",
+        tk.Label(hdr, text="strip emojis & styled text from filenames and folders",
                  font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(side="left", padx=14, pady=4)
 
         # ── Folder picker ─────────────────────────────────────────────────────
@@ -441,7 +481,7 @@ class App(tk.Tk):
         self.table_label.pack(side="left")
 
         tk.Label(hdr_row,
-                 text="Click a filename to open it  •  Right-click for more options  •  Only filenames are modified",
+                 text="Click a filename to open it  •  Right-click for more options  •  Only names are modified, not contents",
                  font=("Segoe UI", 7), bg=CARD, fg="#4a4a60").pack(side="left", padx=(12, 0))
 
         tk.Button(hdr_row, text="Deselect All",
@@ -459,17 +499,19 @@ class App(tk.Tk):
                   relief="flat", padx=8, pady=2,
                   cursor="hand2", bd=0).pack(side="right", padx=(0, 4))
 
-        cols = ("check", "original", "renamed", "type")
+        cols = ("check", "original", "renamed", "type", "kind")
         self.tree = ttk.Treeview(tbl_frame, columns=cols,
                                  show="headings", selectmode="browse")
         self.tree.heading("check",    text="")
         self.tree.heading("original", text="ORIGINAL FILENAME  (click → open file)")
         self.tree.heading("renamed",  text="CLEANED FILENAME")
         self.tree.heading("type",     text="EXT")
+        self.tree.heading("kind",     text="TYPE")
         self.tree.column("check",    width=32,  minwidth=32,  stretch=False, anchor="center")
         self.tree.column("original", width=340, minwidth=160)
         self.tree.column("renamed",  width=340, minwidth=160)
         self.tree.column("type",     width=55,  minwidth=45,  anchor="center")
+        self.tree.column("kind",     width=55,  minwidth=45,  anchor="center")
 
         vsb = ttk.Scrollbar(tbl_frame, orient="vertical",
                             command=self.tree.yview,
@@ -587,12 +629,21 @@ class App(tk.Tk):
     def _refresh_row(self, idx: int):
         iid     = self._row_ids[idx]
         checked = self._checked[idx]
-        p, old_stem, new_stem, ext = self._preview_data[idx]
+        p, old_stem, new_stem, ext, item_type = self._preview_data[idx]
+        if item_type == 'folder':
+            display_old = old_stem
+            display_new = new_stem
+            ext_display = ""
+        else:
+            display_old = old_stem + ext
+            display_new = new_stem + ext
+            ext_display = ext.lstrip('.')
         self.tree.item(iid,
                        values=(CHECK_ON if checked else CHECK_OFF,
-                               old_stem + ext,
-                               new_stem + ext,
-                               ext.lstrip('.')),
+                               display_old,
+                               display_new,
+                               ext_display,
+                               "📁" if item_type == 'folder' else "📄"),
                        tags=("checked" if checked else "unchecked",))
 
     def _select_all(self):
@@ -697,12 +748,22 @@ class App(tk.Tk):
 
     def _insert_rows(self, batch):
         for item in batch:
-            p, old_stem, new_stem, ext = item
+            p, old_stem, new_stem, ext, item_type = item
             self._preview_data.append(item)
             self._checked.append(True)
+            if item_type == 'folder':
+                display_old = old_stem
+                display_new = new_stem
+                ext_display = ""
+                kind_display = "📁"
+            else:
+                display_old = old_stem + ext
+                display_new = new_stem + ext
+                ext_display = ext.lstrip('.')
+                kind_display = "📄"
             iid = self.tree.insert("", "end",
-                                   values=(CHECK_ON, old_stem + ext,
-                                           new_stem + ext, ext.lstrip('.')),
+                                   values=(CHECK_ON, display_old,
+                                           display_new, ext_display, kind_display),
                                    tags=("checked",))
             self._row_ids.append(iid)
             self._found_total += 1
@@ -754,9 +815,9 @@ class App(tk.Tk):
         count = len(snapshot)
         if not messagebox.askyesno(
                 "Confirm rename",
-                f"Rename {count} file{'s' if count != 1 else ''}?\n\n"
-                "Only filenames will be changed.\n"
-                "File contents are never read or modified.",
+                f"Rename {count} item{'s' if count != 1 else ''}?\n\n"
+                "Only names will be changed.\n"
+                "File and folder contents are never read or modified.",
                 icon="question"):
             return
 
@@ -773,9 +834,19 @@ class App(tk.Tk):
         ok     = 0
         errors = []
         total  = len(snapshot)
-        for i, (p, old_stem, new_stem, ext) in enumerate(snapshot):
+        for i, (p, old_stem, new_stem, ext, item_type) in enumerate(snapshot):
             try:
-                safe_rename(p, new_stem, ext)
+                if item_type == 'folder':
+                    # For folders, rename the directory itself
+                    dest = get_unique_path(str(p.parent), new_stem, '')
+                    try:
+                        os.rename(str(p), dest)
+                    except FileExistsError:
+                        dest = get_unique_path(str(p.parent), new_stem + "_r", '')
+                        os.rename(str(p), dest)
+                else:
+                    # For files, use existing safe_rename
+                    safe_rename(p, new_stem, ext)
                 ok += 1
             except Exception as e:
                 errors.append((p.name, str(e)))
@@ -811,8 +882,8 @@ class App(tk.Tk):
             self._set_status(f"✓ {ok} file{'s' if ok != 1 else ''} renamed successfully")
             messagebox.showinfo(
                 "Done",
-                f"Successfully renamed {ok} file{'s' if ok != 1 else ''}.\n\n"
-                "File contents were not modified.")
+                f"Successfully renamed {ok} item{'s' if ok != 1 else ''}.\n\n"
+                "File and folder contents were not modified.")
 
     # ── Progress ───────────────────────────────────────────────────────────────
 
