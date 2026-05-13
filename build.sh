@@ -19,14 +19,20 @@ else
     exit 1
 fi
 
-echo "[1/3] Using $($PY --version)"
+echo "[1/4] Using $($PY --version)"
 echo
 
-echo "[2/3] Installing PyInstaller..."
-$PY -m pip install pyinstaller --quiet
+echo "[2/4] Creating virtual environment..."
+$PY -m venv .venv
+source .venv/bin/activate
 
-echo "[3/3] Building executable..."
-$PY -m PyInstaller --onefile --windowed --name "EmojiRemoverZ" emoji-remover-z.py
+echo "[3/4] Installing PyInstaller..."
+pip install pyinstaller --quiet
+
+echo "[4/4] Building executable..."
+python -m PyInstaller --onefile --windowed --name "EmojiRemoverZ" emoji-remover-z.py
+
+deactivate
 
 echo
 echo "Done!"
