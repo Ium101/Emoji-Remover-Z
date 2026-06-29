@@ -1,3 +1,76 @@
+import sys
+
+# ── Build-time icon generation ───────────────────────────────────────────────
+# Handled first and before any tkinter import: the build scripts call this
+# script with --generate-icon (no display / no tkinter needed) to produce
+# the app icon prior to packaging. Normal app runs are unaffected.
+if "--generate-icon" in sys.argv:
+    def _make_face(size: int):
+        from PIL import Image, ImageDraw
+
+        # Render at 8x and downscale for clean anti-aliasing.
+        SS = 8
+        S = size * SS
+        cx, cy = S / 2, S / 2
+        r = S * 0.47
+        dark = (40, 25, 10, 255)
+
+        img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+
+        outline_w = max(1, round(S * 0.025))
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 200, 0, 255),
+                   outline=(170, 110, 0, 255), width=outline_w)
+
+        # Eyes like "||" — taller than wide so they read as vertical bars
+        # even at small icon sizes (16–32 px), not flat lines.
+        eye_w  = r * 0.11   # narrow width
+        eye_h  = r * 0.20   # tall height — clearly taller than wide
+        eye_y  = cy - r * 0.20
+        eye_dx = r * 0.30
+
+        for ex in (cx - eye_dx, cx + eye_dx):
+            d.rounded_rectangle(
+                [ex - eye_w, eye_y - eye_h, ex + eye_w, eye_y + eye_h],
+                radius=eye_w, fill=dark,
+            )
+
+        # Open mouth smile: a crescent gap (outer half-circle with a
+        # smaller circle cut from the top), wide and with clear margin
+        # from both the eyes above and the chin below.
+        smile_w = r * 0.55
+        smile_top_y = cy + r * 0.02
+        outer_h = r * 0.34
+        outer_bbox = [cx - smile_w, smile_top_y, cx + smile_w, smile_top_y + outer_h * 2]
+
+        mouth_mask = Image.new("L", (S, S), 0)
+        mmd = ImageDraw.Draw(mouth_mask)
+        mmd.pieslice(outer_bbox, start=0, end=180, fill=255)
+
+        inner_w = smile_w * 0.68
+        inner_h = outer_h * 0.50
+        inner_top = smile_top_y + outer_h * 0.55
+        inner_bbox = [cx - inner_w, inner_top, cx + inner_w, inner_top + inner_h * 2]
+        mmd.ellipse(inner_bbox, fill=0)
+
+        mouth_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        mouth_layer.paste(dark, mask=mouth_mask)
+        img = Image.alpha_composite(img, mouth_layer)
+
+        return img.resize((size, size), Image.LANCZOS)
+
+    sizes = [16, 24, 32, 48, 64, 128, 256]
+    imgs = {s: _make_face(s) for s in sizes}
+    imgs[256].save("emoji_remover_z.png")
+    if "--png-only" not in sys.argv:
+        imgs[256].save(
+            "emoji_remover_z.ico",
+            format="ICO",
+            sizes=[(s, s) for s in sizes],
+        )
+    print("Icon generated.")
+    sys.exit(0)
+
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import os
@@ -6,9 +79,235 @@ import unicodedata
 from pathlib import Path
 import threading
 import queue
-import sys
+import configparser
 
 PLATFORM = sys.platform  # 'win32', 'darwin', 'linux'
+
+# ── Settings file (per-OS, stored next to the script/executable) ──────────────
+# Windows -> emoji-remover-z_windows.ini
+# Linux   -> emoji-remover-z_linux.ini
+# (macOS falls back to the linux-style name since it's not explicitly required)
+
+def _app_dir() -> Path:
+    """Directory the script or frozen executable lives in."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+_INI_SUFFIX = "_windows.ini" if PLATFORM == "win32" else "_linux.ini"
+SETTINGS_PATH = _app_dir() / f"emoji-remover-z{_INI_SUFFIX}"
+
+_DEFAULT_SETTINGS = {
+    "language": "en",
+    "theme": "dark",
+    "last_folder": "",
+    "recursive": "False",
+    "rename_folders": "True",
+}
+
+
+class Settings:
+    """Tiny wrapper around configparser for persisting user preferences."""
+
+    SECTION = "settings"
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._cfg = configparser.ConfigParser()
+        self._data = dict(_DEFAULT_SETTINGS)
+        self.load()
+
+    def load(self):
+        try:
+            if self.path.exists():
+                self._cfg.read(self.path, encoding="utf-8")
+                if self._cfg.has_section(self.SECTION):
+                    for key in _DEFAULT_SETTINGS:
+                        if self._cfg.has_option(self.SECTION, key):
+                            self._data[key] = self._cfg.get(self.SECTION, key)
+        except Exception:
+            # Corrupt/unreadable ini -> fall back to defaults silently
+            self._data = dict(_DEFAULT_SETTINGS)
+
+    def save(self):
+        self._cfg[self.SECTION] = self._data
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                self._cfg.write(f)
+        except Exception:
+            pass  # Best-effort persistence; never crash the app over this.
+
+    def get(self, key: str, default=None):
+        return self._data.get(key, default)
+
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        val = self._data.get(key, str(default))
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+    def set(self, key: str, value):
+        self._data[key] = str(value)
+        self.save()
+
+
+# ── Translations ────────────────────────────────────────────────────────────────
+
+TRANSLATIONS = {
+    "en": {
+        "app_title": "Emoji Remover Z",
+        "app_subtitle": "strip emojis & styled text from filenames and folders",
+        "folder_label": "FOLDER",
+        "browse": "Browse",
+        "recursive": "Include subfolders",
+        "rename_folders": "Also rename folders",
+        "scan": "⟳  Scan",
+        "cancel": "✕  Cancel",
+        "rename_selected": "✦  Rename Selected",
+        "rename_n": "✦  Rename {n} File{s}",
+        "preview_default": "PREVIEW  —  files to be renamed",
+        "preview_found": "PREVIEW  —  {n} file{s} found  (click row to toggle)",
+        "table_hint": "Click a filename to open it  •  Right-click for more options  •  Only names are modified, not contents",
+        "select_all": "Select All",
+        "deselect_all": "Deselect All",
+        "col_original": "ORIGINAL FILENAME  (click → open file)",
+        "col_renamed": "CLEANED FILENAME",
+        "col_ext": "EXT",
+        "col_type": "TYPE",
+        "ctx_open_location": "📂  Open file location",
+        "ctx_open_file": "▶  Open file",
+        "ctx_toggle": "☑  Toggle selection",
+        "footer": "Made by User Ium101 from GitHub",
+        "status_counting": "Counting files…",
+        "status_counting_n": "Counting… {n} files found",
+        "status_scanning_n": "Scanning {n} files…",
+        "status_found_n": "Scanning… {n} found",
+        "status_cancelling": "Cancelling…",
+        "status_cancelled_none": "Cancelled — no files found",
+        "status_none_found": "No files to rename found",
+        "status_n_found": "{n} file{s} found{suffix}",
+        "status_renaming_n": "Renaming… {done}/{total}",
+        "status_done": "✓ {n} file{s} renamed successfully",
+        "status_done_errors": "Done — {n} renamed, {e} error(s)",
+        "status_scan_error": "Scan error",
+        "no_folder_title": "No folder",
+        "no_folder_msg": "Please select a valid folder first.",
+        "confirm_rename_title": "Confirm rename",
+        "confirm_rename_msg": "Rename {n} item{s}?\n\nOnly names will be changed.\nFile and folder contents are never read or modified.",
+        "scan_error_title": "Scan error",
+        "scan_error_msg": "An error occurred:\n{e}",
+        "partial_title": "Partial success",
+        "partial_msg": "Renamed {ok} file{s} successfully.\n\n{e} error{es}:\n{lines}",
+        "done_title": "Done",
+        "done_msg": "Successfully renamed {n} item{s}.\n\nFile and folder contents were not modified.",
+        "open_location_warn_title": "Open location",
+        "open_location_warn_msg": "Could not open folder:\n{e}",
+        "open_file_warn_title": "Open file",
+        "open_file_warn_msg": "Could not open file:\n{e}",
+        "select_folder_title": "Select folder",
+        "theme_toggle_dark": "🌙",
+        "theme_toggle_light": "☀",
+        "lang_name": "EN",
+    },
+    "pt": {
+        "app_title": "Emoji Remover Z",
+        "app_subtitle": "remove emojis e texto estilizado de arquivos e pastas",
+        "folder_label": "PASTA",
+        "browse": "Procurar",
+        "recursive": "Incluir subpastas",
+        "rename_folders": "Renomear pastas também",
+        "scan": "⟳  Escanear",
+        "cancel": "✕  Cancelar",
+        "rename_selected": "✦  Renomear Selecionados",
+        "rename_n": "✦  Renomear {n} Arquivo{s}",
+        "preview_default": "PRÉVIA  —  arquivos a serem renomeados",
+        "preview_found": "PRÉVIA  —  {n} arquivo{s} encontrado{s}  (clique na linha para alternar)",
+        "table_hint": "Clique no nome para abrir  •  Clique com botão direito para mais opções  •  Somente os nomes são modificados, não o conteúdo",
+        "select_all": "Selecionar Tudo",
+        "deselect_all": "Desmarcar Tudo",
+        "col_original": "NOME ORIGINAL  (clique → abrir arquivo)",
+        "col_renamed": "NOME LIMPO",
+        "col_ext": "EXT",
+        "col_type": "TIPO",
+        "ctx_open_location": "📂  Abrir local do arquivo",
+        "ctx_open_file": "▶  Abrir arquivo",
+        "ctx_toggle": "☑  Alternar seleção",
+        "footer": "Feito pelo Usuário Ium101 do GitHub",
+        "status_counting": "Contando arquivos…",
+        "status_counting_n": "Contando… {n} arquivos encontrados",
+        "status_scanning_n": "Escaneando {n} arquivos…",
+        "status_found_n": "Escaneando… {n} encontrados",
+        "status_cancelling": "Cancelando…",
+        "status_cancelled_none": "Cancelado — nenhum arquivo encontrado",
+        "status_none_found": "Nenhum arquivo para renomear encontrado",
+        "status_n_found": "{n} arquivo{s} encontrado{s}{suffix}",
+        "status_renaming_n": "Renomeando… {done}/{total}",
+        "status_done": "✓ {n} arquivo{s} renomeado{s} com sucesso",
+        "status_done_errors": "Concluído — {n} renomeado(s), {e} erro(s)",
+        "status_scan_error": "Erro ao escanear",
+        "no_folder_title": "Nenhuma pasta",
+        "no_folder_msg": "Selecione uma pasta válida primeiro.",
+        "confirm_rename_title": "Confirmar renomeação",
+        "confirm_rename_msg": "Renomear {n} item{s}?\n\nApenas os nomes serão alterados.\nO conteúdo de arquivos e pastas nunca é lido ou modificado.",
+        "scan_error_title": "Erro ao escanear",
+        "scan_error_msg": "Ocorreu um erro:\n{e}",
+        "partial_title": "Sucesso parcial",
+        "partial_msg": "{ok} arquivo{s} renomeado{s} com sucesso.\n\n{e} erro{es}:\n{lines}",
+        "done_title": "Concluído",
+        "done_msg": "{n} item{s} renomeado{s} com sucesso.\n\nO conteúdo de arquivos e pastas não foi modificado.",
+        "open_location_warn_title": "Abrir local",
+        "open_location_warn_msg": "Não foi possível abrir a pasta:\n{e}",
+        "open_file_warn_title": "Abrir arquivo",
+        "open_file_warn_msg": "Não foi possível abrir o arquivo:\n{e}",
+        "select_folder_title": "Selecionar pasta",
+        "theme_toggle_dark": "🌙",
+        "theme_toggle_light": "☀",
+        "lang_name": "PT",
+    },
+}
+
+
+# ── Themes ──────────────────────────────────────────────────────────────────────
+
+THEMES = {
+    "dark": {
+        "BG":      "#0f0f13",
+        "CARD":    "#18181f",
+        "BORDER":  "#2a2a35",
+        "ACCENT":  "#ff6b35",
+        "ACCENT2": "#ff9f1c",
+        "FG":      "#e8e8f0",
+        "MUTED":   "#7a7a90",
+        "GREEN":   "#3ddc84",
+        "ENTRY_BG": "#0f0f13",
+        "SEL_BG":   "#2a2a45",
+        "DANGER_BG": "#3a2020",
+        "DANGER_FG": "#ff6060",
+        "DANGER_ACTIVE_BG": "#5a2020",
+        "DANGER_ACTIVE_FG": "#ff9090",
+        "HINT": "#4a4a60",
+        "FOOTER": "#3a3a50",
+        "DISABLED_FG": "#7a5040",
+    },
+    "light": {
+        "BG":      "#f4f4f8",
+        "CARD":    "#ffffff",
+        "BORDER":  "#d8d8e2",
+        "ACCENT":  "#e85d2a",
+        "ACCENT2": "#ff9f1c",
+        "FG":      "#1c1c24",
+        "MUTED":   "#6a6a7e",
+        "GREEN":   "#1f9d57",
+        "ENTRY_BG": "#ffffff",
+        "SEL_BG":   "#ffe2d2",
+        "DANGER_BG": "#ffe0e0",
+        "DANGER_FG": "#c43030",
+        "DANGER_ACTIVE_BG": "#ffc9c9",
+        "DANGER_ACTIVE_FG": "#a02020",
+        "HINT": "#9090a0",
+        "FOOTER": "#a0a0b0",
+        "DISABLED_FG": "#d8a890",
+    },
+}
 
 # All files are supported — no extension filter
 
@@ -325,15 +624,6 @@ def scan_folder(folder: str, recursive: bool, rename_folders: bool,
 CHECK_ON  = "☑"
 CHECK_OFF = "☐"
 
-BG      = "#0f0f13"
-CARD    = "#18181f"
-BORDER  = "#2a2a35"
-ACCENT  = "#ff6b35"
-ACCENT2 = "#ff9f1c"
-FG      = "#e8e8f0"
-MUTED   = "#7a7a90"
-GREEN   = "#3ddc84"
-
 
 # ── Application ────────────────────────────────────────────────────────────────
 
@@ -343,15 +633,23 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
+
+        self.settings = Settings(SETTINGS_PATH)
+        self.lang  = self.settings.get("language", "en")
+        if self.lang not in TRANSLATIONS:
+            self.lang = "en"
+        self.theme = self.settings.get("theme", "dark")
+        if self.theme not in THEMES:
+            self.theme = "dark"
+
         self.title("Emoji Remover Z")
-        self.geometry("960x660")
+        self.geometry("960x690")
         self.minsize(720, 500)
-        self.configure(bg=BG)
         self.resizable(True, True)
 
-        self.folder_var    = tk.StringVar()
-        self.recursive_var = tk.BooleanVar(value=False)
-        self.rename_folders_var = tk.BooleanVar(value=True)
+        self.folder_var    = tk.StringVar(value=self.settings.get("last_folder", ""))
+        self.recursive_var = tk.BooleanVar(value=self.settings.get_bool("recursive", False))
+        self.rename_folders_var = tk.BooleanVar(value=self.settings.get_bool("rename_folders", True))
 
         # Scan state — all parallel lists indexed by row
         self._preview_data: list[tuple] = []   # (Path, old_stem, new_stem, ext, item_type)
@@ -365,16 +663,40 @@ class App(tk.Tk):
         self._scan_total   = 0
         self._prog_visible = False
 
+        self.configure(bg=self._c("BG"))
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Auto-scan on startup if a folder was restored from settings
+        if self.folder_var.get().strip() and os.path.isdir(self.folder_var.get().strip()):
+            self.after(150, self._scan)
+
+    # ── i18n / theme helpers ─────────────────────────────────────────────────────
+
+    def _t(self, key: str, **kwargs) -> str:
+        text = TRANSLATIONS.get(self.lang, TRANSLATIONS["en"]).get(key, key)
+        if kwargs:
+            try:
+                return text.format(**kwargs)
+            except Exception:
+                return text
+        return text
+
+    def _c(self, key: str) -> str:
+        return THEMES.get(self.theme, THEMES["dark"])[key]
+
     def _on_close(self):
         self._cancel_event.set()
+        self.settings.set("last_folder", self.folder_var.get().strip())
         self.destroy()
 
     # ── UI ─────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        BG, CARD, BORDER   = self._c("BG"), self._c("CARD"), self._c("BORDER")
+        ACCENT, ACCENT2    = self._c("ACCENT"), self._c("ACCENT2")
+        FG, MUTED, GREEN   = self._c("FG"), self._c("MUTED"), self._c("GREEN")
+
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("Treeview",
@@ -385,7 +707,7 @@ class App(tk.Tk):
                         background=BORDER, foreground=MUTED,
                         font=("Consolas", 9, "bold"), relief="flat")
         style.map("Treeview",
-                  background=[("selected", "#2a2a45")],
+                  background=[("selected", self._c("SEL_BG"))],
                   foreground=[("selected", FG)])
         style.configure("Vertical.TScrollbar",
                         background=BORDER, troughcolor=CARD,
@@ -404,46 +726,72 @@ class App(tk.Tk):
         tk.Label(hdr, text="✦ EMOJI REMOVER Z",
                  font=("Courier New", 18, "bold"),
                  bg=BG, fg=ACCENT).pack(side="left")
-        tk.Label(hdr, text="strip emojis & styled text from filenames and folders",
-                 font=("Segoe UI", 10), bg=BG, fg=MUTED).pack(side="left", padx=14, pady=4)
+        self.subtitle_lbl = tk.Label(hdr, text=self._t("app_subtitle"),
+                 font=("Segoe UI", 10), bg=BG, fg=MUTED)
+        self.subtitle_lbl.pack(side="left", padx=14, pady=4)
+
+        # Theme + language toggles, right-aligned in the header
+        self.lang_btn = tk.Button(hdr,
+                  text=TRANSLATIONS[self.lang]["lang_name"],
+                  command=self._toggle_language,
+                  font=("Segoe UI", 9, "bold"),
+                  bg=BORDER, fg=FG, activebackground=ACCENT,
+                  activeforeground="#fff", relief="flat",
+                  padx=10, pady=4, cursor="hand2", bd=0, width=3)
+        self.lang_btn.pack(side="right", padx=(8, 0))
+
+        theme_icon = self._t("theme_toggle_light") if self.theme == "dark" else self._t("theme_toggle_dark")
+        self.theme_btn = tk.Button(hdr, text=theme_icon,
+                  command=self._toggle_theme,
+                  font=("Segoe UI", 11),
+                  bg=BORDER, fg=FG, activebackground=ACCENT,
+                  activeforeground="#fff", relief="flat",
+                  padx=10, pady=4, cursor="hand2", bd=0, width=3)
+        self.theme_btn.pack(side="right")
 
         # ── Folder picker ─────────────────────────────────────────────────────
         picker = tk.Frame(self, bg=CARD, bd=0,
                           highlightthickness=1, highlightbackground=BORDER)
         picker.pack(fill="x", padx=28, pady=(0, 12))
-        tk.Label(picker, text="FOLDER", font=("Consolas", 8, "bold"),
-                 bg=CARD, fg=MUTED).pack(anchor="w", padx=14, pady=(10, 2))
+        self.folder_label_lbl = tk.Label(picker, text=self._t("folder_label"), font=("Consolas", 8, "bold"),
+                 bg=CARD, fg=MUTED)
+        self.folder_label_lbl.pack(anchor="w", padx=14, pady=(10, 2))
         row = tk.Frame(picker, bg=CARD)
         row.pack(fill="x", padx=14, pady=(0, 12))
         self.path_entry = tk.Entry(row, textvariable=self.folder_var,
-                                   font=("Consolas", 10), bg="#0f0f13",
+                                   font=("Consolas", 10), bg=self._c("ENTRY_BG"),
                                    fg=FG, insertbackground=ACCENT,
                                    relief="flat", bd=8,
                                    highlightthickness=1,
                                    highlightbackground=BORDER,
                                    highlightcolor=ACCENT)
         self.path_entry.pack(side="left", fill="x", expand=True, ipady=6)
-        tk.Button(row, text="Browse", command=self._browse,
+        self.browse_btn = tk.Button(row, text=self._t("browse"), command=self._browse,
                   font=("Segoe UI", 9, "bold"),
                   bg=BORDER, fg=FG, activebackground=ACCENT,
                   activeforeground="#fff", relief="flat",
-                  padx=16, pady=6, cursor="hand2", bd=0).pack(side="left", padx=(8, 0))
+                  padx=16, pady=6, cursor="hand2", bd=0)
+        self.browse_btn.pack(side="left", padx=(8, 0))
         opt_row = tk.Frame(picker, bg=CARD)
         opt_row.pack(fill="x", padx=14, pady=(0, 12))
-        ttk.Checkbutton(opt_row,
-                        text="Include subfolders (recursive)",
+        self.recursive_chk = ttk.Checkbutton(opt_row,
+                        text=self._t("recursive"),
                         variable=self.recursive_var,
-                        style="TCheckbutton").pack(side="left")
-        ttk.Checkbutton(opt_row,
-                        text="Also rename folders",
+                        command=self._on_recursive_toggle,
+                        style="TCheckbutton")
+        self.recursive_chk.pack(side="left")
+        self.rename_folders_chk = ttk.Checkbutton(opt_row,
+                        text=self._t("rename_folders"),
                         variable=self.rename_folders_var,
-                        style="TCheckbutton").pack(side="left", padx=(20, 0))
+                        command=self._on_rename_folders_toggle,
+                        style="TCheckbutton")
+        self.rename_folders_chk.pack(side="left", padx=(20, 0))
 
         # ── Action buttons ────────────────────────────────────────────────────
         btns = tk.Frame(self, bg=BG)
         btns.pack(fill="x", padx=28, pady=(0, 4))
 
-        self.scan_btn = tk.Button(btns, text="⟳  Scan",
+        self.scan_btn = tk.Button(btns, text=self._t("scan"),
                                   command=self._scan,
                                   font=("Segoe UI", 10, "bold"),
                                   bg=BORDER, fg=FG,
@@ -452,17 +800,17 @@ class App(tk.Tk):
                                   cursor="hand2", bd=0)
         self.scan_btn.pack(side="left")
 
-        self.cancel_btn = tk.Button(btns, text="✕  Cancel",
+        self.cancel_btn = tk.Button(btns, text=self._t("cancel"),
                                     command=self._cancel_scan,
                                     font=("Segoe UI", 10, "bold"),
-                                    bg="#3a2020", fg="#ff6060",
-                                    activebackground="#5a2020",
-                                    activeforeground="#ff9090",
+                                    bg=self._c("DANGER_BG"), fg=self._c("DANGER_FG"),
+                                    activebackground=self._c("DANGER_ACTIVE_BG"),
+                                    activeforeground=self._c("DANGER_ACTIVE_FG"),
                                     relief="flat", padx=14, pady=8,
                                     cursor="hand2", bd=0)
         # shown only while scanning
 
-        self.rename_btn = tk.Button(btns, text="✦  Rename Selected",
+        self.rename_btn = tk.Button(btns, text=self._t("rename_selected"),
                                     command=self._rename,
                                     state="disabled",
                                     font=("Segoe UI", 10, "bold"),
@@ -471,7 +819,7 @@ class App(tk.Tk):
                                     activeforeground="#fff",
                                     relief="flat", padx=20, pady=8,
                                     cursor="hand2", bd=0,
-                                    disabledforeground="#7a5040")
+                                    disabledforeground=self._c("DISABLED_FG"))
         self.rename_btn.pack(side="left", padx=(10, 0))
 
         self.status_lbl = tk.Label(btns, text="",
@@ -494,38 +842,41 @@ class App(tk.Tk):
         hdr_row = tk.Frame(tbl_frame, bg=CARD)
         hdr_row.pack(fill="x", padx=14, pady=(10, 2))
         self.table_label = tk.Label(hdr_row,
-                                    text="PREVIEW  —  files to be renamed",
+                                    text=self._t("preview_default"),
                                     font=("Consolas", 8, "bold"),
                                     bg=CARD, fg=MUTED, anchor="w")
         self.table_label.pack(side="left")
 
-        tk.Label(hdr_row,
-                 text="Click a filename to open it  •  Right-click for more options  •  Only names are modified, not contents",
-                 font=("Segoe UI", 7), bg=CARD, fg="#4a4a60").pack(side="left", padx=(12, 0))
+        self.table_hint_lbl = tk.Label(hdr_row,
+                 text=self._t("table_hint"),
+                 font=("Segoe UI", 7), bg=CARD, fg=self._c("HINT"))
+        self.table_hint_lbl.pack(side="left", padx=(12, 0))
 
-        tk.Button(hdr_row, text="Deselect All",
+        self.deselect_all_btn = tk.Button(hdr_row, text=self._t("deselect_all"),
                   command=self._deselect_all,
                   font=("Segoe UI", 8),
                   bg=BORDER, fg=MUTED,
                   activebackground="#3a3a50", activeforeground=FG,
                   relief="flat", padx=8, pady=2,
-                  cursor="hand2", bd=0).pack(side="right", padx=(4, 0))
-        tk.Button(hdr_row, text="Select All",
+                  cursor="hand2", bd=0)
+        self.deselect_all_btn.pack(side="right", padx=(4, 0))
+        self.select_all_btn = tk.Button(hdr_row, text=self._t("select_all"),
                   command=self._select_all,
                   font=("Segoe UI", 8),
                   bg=BORDER, fg=MUTED,
                   activebackground="#3a3a50", activeforeground=FG,
                   relief="flat", padx=8, pady=2,
-                  cursor="hand2", bd=0).pack(side="right", padx=(0, 4))
+                  cursor="hand2", bd=0)
+        self.select_all_btn.pack(side="right", padx=(0, 4))
 
         cols = ("check", "original", "renamed", "type", "kind")
         self.tree = ttk.Treeview(tbl_frame, columns=cols,
                                  show="headings", selectmode="browse")
         self.tree.heading("check",    text="")
-        self.tree.heading("original", text="ORIGINAL FILENAME  (click → open file)")
-        self.tree.heading("renamed",  text="CLEANED FILENAME")
-        self.tree.heading("type",     text="EXT")
-        self.tree.heading("kind",     text="TYPE")
+        self.tree.heading("original", text=self._t("col_original"))
+        self.tree.heading("renamed",  text=self._t("col_renamed"))
+        self.tree.heading("type",     text=self._t("col_ext"))
+        self.tree.heading("kind",     text=self._t("col_type"))
         self.tree.column("check",    width=32,  minwidth=32,  stretch=False, anchor="center")
         self.tree.column("original", width=340, minwidth=160)
         self.tree.column("renamed",  width=340, minwidth=160)
@@ -551,27 +902,91 @@ class App(tk.Tk):
                                  activebackground=BORDER, activeforeground=FG,
                                  relief="flat", bd=0,
                                  font=("Segoe UI", 9))
-        self._ctx_menu.add_command(label="📂  Open file location",
+        self._ctx_menu.add_command(label=self._t("ctx_open_location"),
                                    command=self._ctx_open_location)
-        self._ctx_menu.add_command(label="▶  Open file",
+        self._ctx_menu.add_command(label=self._t("ctx_open_file"),
                                    command=self._ctx_open_file)
         self._ctx_menu.add_separator()
-        self._ctx_menu.add_command(label="☑  Toggle selection",
+        self._ctx_menu.add_command(label=self._t("ctx_toggle"),
                                    command=self._ctx_toggle)
         self._ctx_iid: str | None = None
         self.tree.bind("<ButtonRelease-3>", self._on_tree_right_click)
 
         # ── Footer ────────────────────────────────────────────────────────────
-        tk.Label(self,
-                 text="Feito pelo Usuário Ium101 do GitHub  /  Made by User Ium101 from GitHub",
-                 font=("Segoe UI", 8), bg=BG, fg="#3a3a50").pack(pady=(4, 10))
+        self.footer_lbl = tk.Label(self,
+                 text=self._t("footer"),
+                 font=("Segoe UI", 8), bg=BG, fg=self._c("FOOTER"))
+        self.footer_lbl.pack(pady=(4, 10))
+
+    # ── Theme / language toggles ─────────────────────────────────────────────────
+
+    def _toggle_theme(self):
+        self.theme = "light" if self.theme == "dark" else "dark"
+        self.settings.set("theme", self.theme)
+        self._rebuild_ui()
+
+    def _toggle_language(self):
+        self.lang = "pt" if self.lang == "en" else "en"
+        self.settings.set("language", self.lang)
+        self._rebuild_ui()
+
+    def _on_recursive_toggle(self):
+        self.settings.set("recursive", self.recursive_var.get())
+
+    def _on_rename_folders_toggle(self):
+        self.settings.set("rename_folders", self.rename_folders_var.get())
+
+    def _rebuild_ui(self):
+        """Tear down and rebuild the UI in place after a theme/language change,
+        preserving any in-progress scan results and folder selection."""
+        preview_snapshot = list(self._preview_data)
+        checked_snapshot  = list(self._checked)
+        folder_value      = self.folder_var.get()
+
+        for child in list(self.winfo_children()):
+            child.destroy()
+
+        self.folder_var.set(folder_value)
+        self._row_ids = []
+        self.configure(bg=self._c("BG"))
+        self._build_ui()
+
+        # Restore preview rows (theme/language change shouldn't lose a scan)
+        if preview_snapshot:
+            self._preview_data = []
+            self._checked = []
+            self._found_total = 0
+            for item, was_checked in zip(preview_snapshot, checked_snapshot):
+                self._preview_data.append(item)
+                self._checked.append(was_checked)
+                p, old_stem, new_stem, ext, item_type = item
+                if item_type == 'folder':
+                    display_old, display_new, ext_display, kind_display = old_stem, new_stem, "", "📁"
+                else:
+                    display_old, display_new = old_stem + ext, new_stem + ext
+                    ext_display, kind_display = ext.lstrip('.'), "📄"
+                iid = self.tree.insert("", "end",
+                                       values=((CHECK_ON if was_checked else CHECK_OFF),
+                                               display_old, display_new,
+                                               ext_display, kind_display),
+                                       tags=("checked" if was_checked else "unchecked",))
+                self._row_ids.append(iid)
+                self._found_total += 1
+            n = self._found_total
+            self.table_label.config(
+                text=self._t("preview_found", n=n, s="s" if n != 1 else ""))
+            self._update_rename_btn()
 
     # ── Browse ─────────────────────────────────────────────────────────────────
 
     def _browse(self):
-        folder = filedialog.askdirectory(title="Select folder")
+        folder = filedialog.askdirectory(title=self._t("select_folder_title"))
         if folder:
             self.folder_var.set(folder)
+            self.settings.set("last_folder", folder)
+            self._scan()
+
+
 
     # ── Checkbox helpers ───────────────────────────────────────────────────────
 
@@ -609,7 +1024,8 @@ class App(tk.Tk):
                 # Linux: open the parent folder (no universal "select file" standard)
                 subprocess.Popen(["xdg-open", str(p.parent)])
         except Exception as e:
-            messagebox.showwarning("Open location", f"Could not open folder:\n{e}")
+            messagebox.showwarning(self._t("open_location_warn_title"),
+                                   self._t("open_location_warn_msg", e=e))
 
     def _open_file(self, iid: str):
         """Open the file with its default application."""
@@ -624,7 +1040,8 @@ class App(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", str(p)])
         except Exception as e:
-            messagebox.showwarning("Open file", f"Could not open file:\n{e}")
+            messagebox.showwarning(self._t("open_file_warn_title"),
+                                   self._t("open_file_warn_msg", e=e))
 
     def _on_tree_right_click(self, event):
         iid = self.tree.identify_row(event.y)
@@ -682,17 +1099,19 @@ class App(tk.Tk):
         if n > 0:
             self.rename_btn.config(
                 state="normal",
-                text=f"✦  Rename {n} File{'s' if n != 1 else ''}")
+                text=self._t("rename_n", n=n, s="s" if n != 1 else ""))
         else:
-            self.rename_btn.config(state="disabled", text="✦  Rename Selected")
+            self.rename_btn.config(state="disabled", text=self._t("rename_selected"))
 
     # ── Scan ───────────────────────────────────────────────────────────────────
 
     def _scan(self):
         folder = self.folder_var.get().strip()
         if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("No folder", "Please select a valid folder first.")
+            messagebox.showwarning(self._t("no_folder_title"), self._t("no_folder_msg"))
             return
+
+        self.settings.set("last_folder", folder)
 
         # Reset all state
         self._cancel_event.clear()
@@ -704,10 +1123,10 @@ class App(tk.Tk):
         self._scan_queue  = queue.Queue()
 
         self.tree.delete(*self.tree.get_children())
-        self.table_label.config(text="PREVIEW  —  files to be renamed")
-        self._set_status("Counting files…")
+        self.table_label.config(text=self._t("preview_default"))
+        self._set_status(self._t("status_counting"))
         self.scan_btn.config(state="disabled")
-        self.rename_btn.config(state="disabled", text="✦  Rename Selected")
+        self.rename_btn.config(state="disabled", text=self._t("rename_selected"))
         self.cancel_btn.pack(side="left", padx=(10, 0))
         self.progress["value"] = 0
         self._show_progress(True)
@@ -745,11 +1164,11 @@ class App(tk.Tk):
                     # Phase 1: asymptotic 0→40% so progress is always visible
                     n = msg[1]
                     self.progress["value"] = 40 * (1 - 1 / (1 + n / 25))
-                    self._set_status(f"Counting… {n} files found")
+                    self._set_status(self._t("status_counting_n", n=n))
                 elif tag == "__total__":
                     self._scan_total = msg[1]
                     self.progress["value"] = 40
-                    self._set_status(f"Scanning {self._scan_total} files…")
+                    self._set_status(self._t("status_scanning_n", n=self._scan_total))
                 elif tag == "__progress__":
                     _, done, total = msg
                     if total > 0:
@@ -786,7 +1205,7 @@ class App(tk.Tk):
                                    tags=("checked",))
             self._row_ids.append(iid)
             self._found_total += 1
-        self._set_status(f"Scanning… {self._found_total} found")
+        self._set_status(self._t("status_found_n", n=self._found_total))
         self._update_rename_btn()
 
     def _finish_scan(self, remaining_batch, error=None):
@@ -800,8 +1219,8 @@ class App(tk.Tk):
             self._insert_rows(remaining_batch)
 
         if error:
-            messagebox.showerror("Scan error", f"An error occurred:\n{error}")
-            self._set_status("Scan error")
+            messagebox.showerror(self._t("scan_error_title"), self._t("scan_error_msg", e=error))
+            self._set_status(self._t("status_scan_error"))
             return
 
         count     = self._found_total
@@ -809,17 +1228,17 @@ class App(tk.Tk):
         if count:
             suffix = " (cancelled)" if cancelled else ""
             self.table_label.config(
-                text=f"PREVIEW  —  {count} file{'s' if count != 1 else ''} found"
-                     "  (click row to toggle)")
-            self._set_status(f"{count} file{'s' if count != 1 else ''} found{suffix}")
+                text=self._t("preview_found", n=count, s="s" if count != 1 else ""))
+            self._set_status(self._t("status_n_found", n=count,
+                                     s="s" if count != 1 else "", suffix=suffix))
             self._update_rename_btn()
         else:
             self._set_status(
-                "Cancelled — no files found" if cancelled else "No files to rename found")
+                self._t("status_cancelled_none") if cancelled else self._t("status_none_found"))
 
     def _cancel_scan(self):
         self._cancel_event.set()
-        self._set_status("Cancelling…")
+        self._set_status(self._t("status_cancelling"))
 
     # ── Rename ─────────────────────────────────────────────────────────────────
 
@@ -833,16 +1252,14 @@ class App(tk.Tk):
 
         count = len(snapshot)
         if not messagebox.askyesno(
-                "Confirm rename",
-                f"Rename {count} item{'s' if count != 1 else ''}?\n\n"
-                "Only names will be changed.\n"
-                "File and folder contents are never read or modified.",
+                self._t("confirm_rename_title"),
+                self._t("confirm_rename_msg", n=count, s="s" if count != 1 else ""),
                 icon="question"):
             return
 
         self.rename_btn.config(state="disabled")
         self.scan_btn.config(state="disabled")
-        self._set_status("Renaming…")
+        self._set_status(self._t("status_renaming_n", done=0, total=count))
         self.progress["value"] = 0
         self._show_progress(True)
 
@@ -875,7 +1292,7 @@ class App(tk.Tk):
 
     def _set_rename_progress(self, pct: float, done: int, total: int):
         self.progress["value"] = pct
-        self._set_status(f"Renaming… {done}/{total}")
+        self._set_status(self._t("status_renaming_n", done=done, total=total))
 
     def _finish_rename(self, ok: int, errors: list):
         self._show_progress(False)
@@ -885,24 +1302,24 @@ class App(tk.Tk):
         self._row_ids.clear()
         self._checked.clear()
         self._found_total = 0
-        self.table_label.config(text="PREVIEW  —  files to be renamed")
-        self.rename_btn.config(state="disabled", text="✦  Rename Selected")
+        self.table_label.config(text=self._t("preview_default"))
+        self.rename_btn.config(state="disabled", text=self._t("rename_selected"))
 
         if errors:
             err_lines = "\n".join(f"• {n}: {m}" for n, m in errors[:50])
             if len(errors) > 50:
                 err_lines += f"\n… and {len(errors) - 50} more."
             messagebox.showwarning(
-                "Partial success",
-                f"Renamed {ok} file{'s' if ok != 1 else ''} successfully.\n\n"
-                f"{len(errors)} error{'s' if len(errors) != 1 else ''}:\n{err_lines}")
-            self._set_status(f"Done — {ok} renamed, {len(errors)} error(s)")
+                self._t("partial_title"),
+                self._t("partial_msg", ok=ok, s="s" if ok != 1 else "",
+                        e=len(errors), es="s" if len(errors) != 1 else "",
+                        lines=err_lines))
+            self._set_status(self._t("status_done_errors", n=ok, e=len(errors)))
         else:
-            self._set_status(f"✓ {ok} file{'s' if ok != 1 else ''} renamed successfully")
+            self._set_status(self._t("status_done", n=ok, s="s" if ok != 1 else ""))
             messagebox.showinfo(
-                "Done",
-                f"Successfully renamed {ok} item{'s' if ok != 1 else ''}.\n\n"
-                "File and folder contents were not modified.")
+                self._t("done_title"),
+                self._t("done_msg", n=ok, s="s" if ok != 1 else ""))
 
     # ── Progress ───────────────────────────────────────────────────────────────
 
