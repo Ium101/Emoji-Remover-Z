@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys
 
 # ── Build-time icon generation ───────────────────────────────────────────────
@@ -632,7 +633,7 @@ class App(tk.Tk):
     _POLL_MS    = 50
 
     def __init__(self):
-        super().__init__()
+        super().__init__(className="Emoji_Remover_Z")
 
         self.settings = Settings(SETTINGS_PATH)
         self.lang  = self.settings.get("language", "en")
