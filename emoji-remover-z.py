@@ -92,6 +92,9 @@ import shutil
 import subprocess
 import datetime
 from urllib.parse import quote
+import hashlib
+import base64
+import io
 
 PLATFORM = sys.platform  # 'win32', 'darwin', 'linux'
 
@@ -116,6 +119,7 @@ _DEFAULT_SETTINGS = {
     "last_folder": "",
     "recursive": "False",
     "unchecked": "[]",          # JSON list of preview rows the user un-ticked
+    "history": "[]",            # JSON list of previously used folders / file picks
 }
 
 
@@ -180,8 +184,9 @@ TRANSLATIONS = {
     "en": {
         "app_title": "Emoji Remover Z",
         "app_subtitle": "strip emojis & styled text from filenames and folders",
-        "folder_label": "FOLDER",
-        "browse": "Browse",
+        "folder_label": "FOLDER OR FILES",
+        "browse_folder": "📁  Browse folder",
+        "browse_files": "🖼  Browse files",
         "recursive": "Include subfolders",
         "scan": "⟳  Scan",
         "cancel": "✕  Cancel",
@@ -215,7 +220,7 @@ TRANSLATIONS = {
         "status_done_errors": "Done — {n} renamed, {e} error(s)",
         "status_scan_error": "Scan error",
         "no_folder_title": "No folder",
-        "no_folder_msg": "Please select a valid folder first.",
+        "no_folder_msg": "Please select a valid folder or files first.",
         "confirm_rename_title": "Confirm rename",
         "confirm_rename_msg": "Rename {n} item{s}?\n\nOnly names will be changed.\nFile and folder contents are never modified.",
         "scan_error_title": "Scan error",
@@ -233,6 +238,22 @@ TRANSLATIONS = {
         "open_file_warn_title": "Open file",
         "open_file_warn_msg": "Could not open file:\n{e}",
         "select_folder_title": "Select folder",
+        "select_files_title": "Select files",
+        "files_n": "{n} files",
+        "tp_places": "PLACES",
+        "tp_recent": "RECENT",
+        "tp_home": "Home",
+        "tp_root": "Computer",
+        "tp_up": "↑  Up",
+        "tp_hidden": "Hidden files",
+        "tp_selected": "{n} selected",
+        "tp_select": "Select",
+        "tp_cancel": "Cancel",
+        "tp_all": "Select all",
+        "tp_none": "Clear",
+        "tp_empty": "No files in this folder",
+        "tp_unreadable": "Can't open this folder",
+        "tp_hint": "Click to tick  •  Shift+click for a range  •  Double-click a folder to open it  •  Double-click a file to pick just that one",
         "theme_toggle_dark": "🌙",
         "theme_toggle_light": "☀",
         "lang_name": "EN",
@@ -240,8 +261,9 @@ TRANSLATIONS = {
     "pt": {
         "app_title": "Emoji Remover Z",
         "app_subtitle": "remove emojis e texto estilizado de arquivos e pastas",
-        "folder_label": "PASTA",
-        "browse": "Procurar",
+        "folder_label": "PASTA OU ARQUIVOS",
+        "browse_folder": "📁  Procurar pasta",
+        "browse_files": "🖼  Procurar arquivos",
         "recursive": "Incluir subpastas",
         "scan": "⟳  Escanear",
         "cancel": "✕  Cancelar",
@@ -275,7 +297,7 @@ TRANSLATIONS = {
         "status_done_errors": "Concluído — {n} renomeado(s), {e} erro(s)",
         "status_scan_error": "Erro ao escanear",
         "no_folder_title": "Nenhuma pasta",
-        "no_folder_msg": "Selecione uma pasta válida primeiro.",
+        "no_folder_msg": "Selecione uma pasta ou arquivos válidos primeiro.",
         "confirm_rename_title": "Confirmar renomeação",
         "confirm_rename_msg": "Renomear {n} item{s}?\n\nApenas os nomes serão alterados.\nO conteúdo de arquivos e pastas nunca é modificado.",
         "scan_error_title": "Erro ao escanear",
@@ -293,6 +315,22 @@ TRANSLATIONS = {
         "open_file_warn_title": "Abrir arquivo",
         "open_file_warn_msg": "Não foi possível abrir o arquivo:\n{e}",
         "select_folder_title": "Selecionar pasta",
+        "select_files_title": "Selecionar arquivos",
+        "files_n": "{n} arquivos",
+        "tp_places": "LOCAIS",
+        "tp_recent": "RECENTES",
+        "tp_home": "Pasta pessoal",
+        "tp_root": "Computador",
+        "tp_up": "↑  Acima",
+        "tp_hidden": "Arquivos ocultos",
+        "tp_selected": "{n} selecionado(s)",
+        "tp_select": "Selecionar",
+        "tp_cancel": "Cancelar",
+        "tp_all": "Selecionar tudo",
+        "tp_none": "Limpar",
+        "tp_empty": "Nenhum arquivo nesta pasta",
+        "tp_unreadable": "Não foi possível abrir esta pasta",
+        "tp_hint": "Clique para marcar  •  Shift+clique para um intervalo  •  Duplo clique em uma pasta para abrir  •  Duplo clique em um arquivo para escolher só ele",
         "theme_toggle_dark": "🌙",
         "theme_toggle_light": "☀",
         "lang_name": "PT",
@@ -840,19 +878,32 @@ def move_to_trash(path: str) -> None:
 
 # ── Folder scanner ─────────────────────────────────────────────────────────────
 
-def scan_folder(folder: str, recursive: bool,
+def scan_folder(folder, recursive: bool,
                 cancel_event: threading.Event,
-                out_queue: queue.Queue) -> None:
+                out_queue: queue.Queue,
+                picked_files: "list[str] | None" = None) -> None:
     """
     Phase 1 — walk and collect all supported files and folders, emitting __count__ per item.
     Phase 2 — check each name, emitting __item__ (match) or __progress__ (no match).
     Ends with None sentinel.
     """
-    root_path = Path(folder)
+    root_path = Path(folder) if picked_files is None else None
     all_items: list[tuple[Path, str]] = []  # (path, 'file' or 'folder')
 
+    # "Browse files" mode: only the files the user picked are checked —
+    # nothing is walked and no folders are involved.
+    if picked_files is not None:
+        for f in picked_files:
+            if cancel_event.is_set():
+                out_queue.put(None)
+                return
+            if os.path.isfile(f):
+                all_items.append((Path(f), 'file'))
+                out_queue.put(("__count__", len(all_items)))
+
     try:
-        for dirpath, dirs, files in os.walk(str(root_path)):
+        for dirpath, dirs, files in (os.walk(str(root_path))
+                                     if root_path is not None else ()):
             if cancel_event.is_set():
                 out_queue.put(None)
                 return
@@ -909,6 +960,693 @@ CHECK_ON  = "☑"
 CHECK_OFF = "☐"
 
 
+# ── Source = what gets scanned: one folder, or a hand-picked set of files ──────
+# {"kind": "folder" | "files", "paths": [...]}
+
+HISTORY_MAX       = 20     # remembered locations in the dropdown
+HISTORY_MAX_PATHS = 300    # bigger file picks still work, just aren't remembered
+
+
+def make_source(kind: str, paths) -> dict:
+    return {"kind": kind,
+            "paths": [os.path.normpath(os.path.expanduser(p)) for p in paths]}
+
+
+def source_key(src: dict) -> tuple:
+    return (src["kind"], tuple(os.path.normcase(p) for p in src["paths"]))
+
+
+def source_valid(src) -> bool:
+    if not src or not src.get("paths"):
+        return False
+    if src["kind"] == "folder":
+        return os.path.isdir(src["paths"][0])
+    return any(os.path.isfile(p) for p in src["paths"])
+
+
+def source_dir(src: dict) -> str:
+    """The folder a source lives in (the folder itself, or the files' parent)."""
+    paths = src["paths"]
+    if src["kind"] == "folder":
+        return paths[0]
+    try:
+        return os.path.commonpath([os.path.dirname(p) for p in paths])
+    except ValueError:                 # files on different Windows drives
+        return os.path.dirname(paths[0])
+
+
+def native_linux_dialog(kind: str, title: str, start: str):
+    """Open the desktop's own file/folder chooser (KDE Plasma's dialog via
+    kdialog, GNOME/GTK's via zenity) instead of Tk's dated built-in one.
+
+    kind: "folder" or "files" (multi-select).
+    Returns a list of chosen paths ([] if the user cancelled), or None when no
+    native chooser is installed / usable, so the caller can fall back to Tk."""
+    desktop = (os.environ.get("XDG_CURRENT_DESKTOP", "") + " " +
+               os.environ.get("DESKTOP_SESSION", "")).upper()
+    order = (["kdialog", "zenity"] if ("KDE" in desktop or "PLASMA" in desktop)
+             else ["zenity", "kdialog"])
+    start_dir = start.rstrip("/") + "/"
+    for tool in order:
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        if tool == "kdialog":
+            cmd = [exe, "--title", title]
+            if kind == "folder":
+                cmd += ["--getexistingdirectory", start_dir]
+            else:
+                cmd += ["--multiple", "--separate-output",
+                        "--getopenfilename", start_dir]
+        else:
+            cmd = [exe, "--file-selection", f"--title={title}",
+                   f"--filename={start_dir}"]
+            if kind == "folder":
+                cmd.append("--directory")
+            else:
+                cmd += ["--multiple", "--separator=\n"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError:
+            continue
+        if r.returncode == 0:
+            return [ln.rstrip("\r") for ln in r.stdout.split("\n") if ln.strip()]
+        if r.returncode == 1:          # user pressed Cancel / closed it
+            return []
+        # any other exit code: this tool is unusable here, try the next one
+    return None
+
+
+class ThumbPicker(tk.Toplevel):
+    """Thumbnail-grid multi-file picker (Linux "Browse files").
+
+    A gallery-style browser instead of a list/tree dialog: every file is a
+    tile with a preview, folders open on double-click, clicking a tile ticks
+    it. Thumbnails come from the desktop's own thumbnail cache
+    (~/.cache/thumbnails, filled by Dolphin / Nautilus) and, when Pillow is
+    installed, straight from the image files. Without either, a type icon is
+    shown instead. Tiles are drawn on demand, so huge folders stay fast.
+
+    show() returns the list of chosen file paths ([] if cancelled)."""
+
+    SIZES = (("S", 96), ("M", 144), ("L", 208))
+    _pil_mod = False          # False = not tried yet, None = not installed
+    _EXT_ICONS = (
+        (("jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "avif",
+          "heic", "heif", "svg", "ico", "jxl"), "🖼"),
+        (("mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v"), "🎞"),
+        (("mp3", "flac", "wav", "ogg", "opus", "m4a", "aac"), "🎵"),
+        (("zip", "rar", "7z", "tar", "gz", "xz", "bz2", "zst"), "🗜"),
+    )
+
+    def __init__(self, parent, title, start, recent, colors, t):
+        super().__init__(parent)
+        self.withdraw()
+        try:
+            self._init(parent, title, start, recent, colors, t)
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+            raise
+
+    # ── construction ─────────────────────────────────────────────────────────
+
+    def _init(self, parent, title, start, recent, colors, t):
+        self._col, self._tr = colors, t
+        self.title(title)
+        self.configure(bg=colors["BG"])
+        self.transient(parent)
+        self.minsize(680, 440)
+        pw, ph = 980, 660
+        try:
+            x = parent.winfo_rootx() + max(0, (parent.winfo_width() - pw) // 2)
+            y = parent.winfo_rooty() + max(0, (parent.winfo_height() - ph) // 2)
+            self.geometry(f"{pw}x{ph}+{x}+{y}")
+        except tk.TclError:
+            self.geometry(f"{pw}x{ph}")
+
+        self.result: list = []
+        self._sel: dict = {}            # ticked paths, in tick order
+        self._entries: list = []        # (name, path, is_dir) of the open folder
+        self._cwd = ""
+        self._error = False
+        self._size = 144
+        self._gen = 0                   # bumps on every folder change
+        self._thumbs: dict = {}         # (path, size) -> PhotoImage | None
+        self._requested: set = set()
+        self._reqq = queue.LifoQueue()  # newest request (= on screen) first
+        self._resq = queue.Queue()
+        self._redraw_job = None
+        self._poll_job = None
+        self._last_idx = None
+        self._tw = self._th = 1
+        self._cols, self._rows, self._x0 = 1, 0, 0
+        self._places: list = []
+        self._hidden = tk.BooleanVar(value=False)
+        self._path_var = tk.StringVar()
+
+        self._build(recent)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.bind("<Return>", self._on_return)
+        self.bind("<BackSpace>", self._on_backspace)
+        self.bind("<Control-a>", self._on_ctrl_a)
+
+        threading.Thread(target=self._thumb_worker, daemon=True).start()
+        self._poll_job = self.after(40, self._poll)
+        self._go(start)
+
+    def _btn(self, parent, text, cmd, accent=False, small=False):
+        c = self._col
+        return tk.Button(parent, text=text, command=cmd,
+                         font=("Segoe UI", 8 if small else 9, "bold"),
+                         bg=c["ACCENT"] if accent else c["BORDER"],
+                         fg="#fff" if accent else c["FG"],
+                         activebackground=c["ACCENT2"] if accent else c["ACCENT"],
+                         activeforeground="#fff", relief="flat",
+                         padx=8 if small else 14, pady=4 if small else 6,
+                         cursor="hand2", bd=0,
+                         disabledforeground=c["DISABLED_FG"])
+
+    def _build(self, recent):
+        c = self._col
+        BG, CARD, BORDER, ACCENT = c["BG"], c["CARD"], c["BORDER"], c["ACCENT"]
+
+        # toolbar: up, path, thumbnail size, hidden files
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=14, pady=(12, 8))
+        self._btn(bar, self._tr("tp_up"), self._up).pack(side="left")
+        self._path_entry = tk.Entry(
+            bar, textvariable=self._path_var, font=("Consolas", 10),
+            bg=c["ENTRY_BG"], fg=c["FG"], insertbackground=ACCENT,
+            relief="flat", bd=6, highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT)
+        self._path_entry.pack(side="left", fill="x", expand=True, padx=8, ipady=3)
+        self._size_btns = {}
+        for label, px in self.SIZES:
+            b = self._btn(bar, label, lambda px=px: self._set_size(px), small=True)
+            b.pack(side="left", padx=(2, 0))
+            self._size_btns[px] = b
+        ttk.Checkbutton(bar, text=self._tr("tp_hidden"), variable=self._hidden,
+                        command=self._reload, style="TCheckbutton"
+                        ).pack(side="left", padx=(12, 0))
+        self._mark_size()
+
+        # body: places sidebar + thumbnail grid
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=14)
+        side = tk.Frame(body, bg=CARD, highlightthickness=1,
+                        highlightbackground=BORDER)
+        side.pack(side="left", fill="y", padx=(0, 8))
+        self._plist = tk.Listbox(
+            side, width=26, bg=CARD, fg=c["FG"], selectbackground=c["SEL_BG"],
+            selectforeground=c["FG"], highlightthickness=0, bd=0,
+            activestyle="none", exportselection=False, font=("Segoe UI", 9))
+        self._plist.pack(fill="both", expand=True, padx=4, pady=6)
+        self._fill_places(recent)
+        self._plist.bind("<<ListboxSelect>>", self._on_place)
+
+        main = tk.Frame(body, bg=CARD, highlightthickness=1,
+                        highlightbackground=BORDER)
+        main.pack(side="left", fill="both", expand=True)
+        self.canvas = tk.Canvas(main, bg=CARD, highlightthickness=0, bd=0,
+                                yscrollincrement=48)
+        vsb = ttk.Scrollbar(main, orient="vertical", command=self.canvas.yview,
+                            style="Vertical.TScrollbar")
+        self.canvas.configure(
+            yscrollcommand=lambda a, b: (vsb.set(a, b), self._schedule_redraw()))
+        vsb.pack(side="right", fill="y", padx=(0, 4), pady=4)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _e: self._relayout())
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Double-Button-1>", self._on_double)
+        self.canvas.bind("<Button-4>", self._wheel)
+        self.canvas.bind("<Button-5>", self._wheel)
+        self.canvas.bind("<MouseWheel>", self._wheel)
+
+        tk.Label(self, text=self._tr("tp_hint"), font=("Segoe UI", 8), bg=BG,
+                 fg=c["HINT"], anchor="w").pack(fill="x", padx=16, pady=(6, 0))
+        foot = tk.Frame(self, bg=BG)
+        foot.pack(fill="x", padx=14, pady=(6, 12))
+        self._status = tk.Label(foot, text="", font=("Segoe UI", 9), bg=BG,
+                                fg=c["MUTED"])
+        self._status.pack(side="left")
+        self._ok_btn = self._btn(foot, self._tr("tp_select"), self._accept,
+                                 accent=True)
+        self._ok_btn.pack(side="right")
+        self._btn(foot, self._tr("tp_cancel"), self._cancel).pack(
+            side="right", padx=(0, 8))
+        self._btn(foot, self._tr("tp_none"), self._clear, small=True).pack(
+            side="right", padx=(0, 14))
+        self._btn(foot, self._tr("tp_all"), self._select_all, small=True).pack(
+            side="right", padx=(0, 6))
+        self._update_status()
+
+    # ── places sidebar ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _xdg_dirs() -> dict:
+        out = {}
+        try:
+            cfg = os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                               or os.path.expanduser("~/.config"),
+                               "user-dirs.dirs")
+            with open(cfg, encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r'XDG_(\w+)_DIR="(.*)"', line.strip())
+                    if m:
+                        out[m.group(1)] = m.group(2).replace(
+                            "$HOME", os.path.expanduser("~"))
+        except OSError:
+            pass
+        return out
+
+    def _fill_places(self, recent):
+        home = os.path.expanduser("~")
+        user = os.path.basename(home)
+        xdg = self._xdg_dirs()
+        items = [(self._tr("tp_places"), None),
+                 ("🏠  " + self._tr("tp_home"), home)]
+        for key, fallback in (("DESKTOP", "Desktop"), ("DOCUMENTS", "Documents"),
+                              ("DOWNLOAD", "Downloads"), ("PICTURES", "Pictures"),
+                              ("VIDEOS", "Videos"), ("MUSIC", "Music")):
+            p = xdg.get(key) or os.path.join(home, fallback)
+            if os.path.isdir(p) and os.path.normpath(p) != os.path.normpath(home):
+                items.append(("📁  " + os.path.basename(p.rstrip("/")), p))
+        seen = set()
+        for base in (f"/run/media/{user}", f"/media/{user}", "/media", "/mnt"):
+            try:
+                names = sorted(os.listdir(base))
+            except OSError:
+                continue
+            for n in names:
+                p = os.path.join(base, n)
+                if n.startswith(".") or p in seen or not os.path.isdir(p):
+                    continue
+                seen.add(p)
+                items.append(("💽  " + n, p))
+        items.append(("🖥  " + self._tr("tp_root"), "/"))
+        if recent:
+            items.append((self._tr("tp_recent"), None))
+            for d in recent:
+                short = ("~" + d[len(home):]
+                         if d == home or d.startswith(home + os.sep) else d)
+                items.append(("🕘  " + short, d))
+        self._places = [p for _l, p in items]
+        for i, (label, p) in enumerate(items):
+            self._plist.insert("end", label)
+            if p is None:                       # section header
+                self._plist.itemconfig(i, fg=self._col["MUTED"],
+                                       selectbackground=self._col["CARD"],
+                                       selectforeground=self._col["MUTED"])
+
+    def _on_place(self, _e=None):
+        sel = self._plist.curselection()
+        if sel and self._places[sel[0]]:
+            self._go(self._places[sel[0]])
+
+    # ── navigation / listing ─────────────────────────────────────────────────
+
+    def _go(self, path):
+        self._cwd = os.path.abspath(os.path.expanduser(path))
+        self._path_var.set(self._cwd)
+        self._gen += 1
+        self._requested.clear()
+        self._last_idx = None
+        self._read_dir()
+        self.canvas.yview_moveto(0)
+        self._relayout()
+
+    def _reload(self):
+        self._last_idx = None
+        self._read_dir()
+        self._relayout()
+
+    def _up(self):
+        parent = os.path.dirname(self._cwd.rstrip(os.sep)) or os.sep
+        if parent != self._cwd:
+            self._go(parent)
+
+    def _read_dir(self):
+        dirs, files = [], []
+        self._error = False
+        try:
+            with os.scandir(self._cwd) as it:
+                for e in it:
+                    if e.name.startswith(".") and not self._hidden.get():
+                        continue
+                    try:
+                        isd = e.is_dir()
+                    except OSError:
+                        isd = False
+                    (dirs if isd else files).append((e.name, e.path, isd))
+        except OSError:
+            self._error = True
+
+        def natural(item):
+            parts = re.split(r"(\d+)", item[0].casefold())
+            return [int(p) if i % 2 else p for i, p in enumerate(parts)]
+        dirs.sort(key=natural)
+        files.sort(key=natural)
+        self._entries = dirs + files
+
+    # ── drawing (virtualised: only the visible rows exist as canvas items) ───
+
+    def _relayout(self):
+        cv = self.canvas
+        w, h = max(cv.winfo_width(), 200), max(cv.winfo_height(), 100)
+        s = self._size
+        self._tw, self._th = s + 28, s + 58
+        self._cols = max(1, w // self._tw)
+        self._rows = -(-len(self._entries) // self._cols)
+        self._x0 = max(0, (w - self._cols * self._tw) // 2)
+        cv.configure(scrollregion=(0, 0, w, max(h, self._rows * self._th + 12)))
+        self._schedule_redraw()
+
+    def _schedule_redraw(self):
+        if self._redraw_job is None:
+            self._redraw_job = self.after_idle(self._redraw)
+
+    def _redraw(self):
+        self._redraw_job = None
+        cv, c = self.canvas, self._col
+        cv.delete("all")
+        n = len(self._entries)
+        if n == 0:
+            cv.create_text(cv.winfo_width() // 2, 80, fill=c["MUTED"],
+                           font=("Segoe UI", 11),
+                           text=self._tr("tp_unreadable" if self._error
+                                         else "tp_empty"))
+            return
+        top, h = cv.canvasy(0), cv.winfo_height()
+        r0 = max(0, int(top // self._th) - 1)
+        r1 = min(self._rows, int((top + h) // self._th) + 2)
+        for r in range(r0, r1):
+            for col in range(self._cols):
+                i = r * self._cols + col
+                if i >= n:
+                    break
+                self._draw_tile(i, self._x0 + col * self._tw, 6 + r * self._th)
+
+    def _glyph(self, name: str) -> str:
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        for exts, icon in self._EXT_ICONS:
+            if ext in exts:
+                return icon
+        return "📄"
+
+    def _draw_tile(self, i, x, y):
+        cv, c, s = self.canvas, self._col, self._size
+        name, path, is_dir = self._entries[i]
+        sel = path in self._sel
+        cx, cy = x + self._tw // 2, y + 8 + s // 2
+        if sel:
+            cv.create_rectangle(x + 2, y, x + self._tw - 2, y + self._th - 6,
+                                fill=c["SEL_BG"], outline=c["ACCENT"], width=2)
+        img = None
+        if not is_dir:
+            key = (path, s)
+            if key in self._thumbs:
+                img = self._thumbs[key]
+            elif key not in self._requested:
+                self._requested.add(key)
+                self._reqq.put((self._gen, path, s))
+        if img is not None:
+            cv.create_image(cx, cy, image=img)
+        else:
+            cv.create_text(cx, cy, text="📁" if is_dir else self._glyph(name),
+                           fill=c["ACCENT2"] if is_dir else c["MUTED"],
+                           font=("Segoe UI", max(18, int(s * 0.34))))
+        per_line = max(8, int((self._tw - 8) / 6.5))
+        short = name if len(name) <= per_line * 2 else name[:per_line * 2 - 1] + "…"
+        cv.create_text(cx, y + s + 14, text=short, width=self._tw - 8,
+                       anchor="n", justify="center", fill=c["FG"],
+                       font=("Segoe UI", 8))
+        if sel:
+            cv.create_oval(x + self._tw - 26, y + 4, x + self._tw - 6, y + 24,
+                           fill=c["ACCENT"], outline="")
+            cv.create_text(x + self._tw - 16, y + 14, text="✓", fill="#fff",
+                           font=("Segoe UI", 9, "bold"))
+
+    # ── mouse / keyboard ─────────────────────────────────────────────────────
+
+    def _index_at(self, e):
+        x, y = self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
+        col, row = int((x - self._x0) // self._tw), int((y - 6) // self._th)
+        if col < 0 or col >= self._cols or row < 0:
+            return None
+        i = row * self._cols + col
+        return i if i < len(self._entries) else None
+
+    def _on_click(self, e):
+        self.canvas.focus_set()
+        i = self._index_at(e)
+        if i is None:
+            return
+        _name, path, is_dir = self._entries[i]
+        if is_dir:
+            return                      # folders open on double-click
+        if (e.state & 0x1) and self._last_idx is not None:     # Shift = range
+            lo, hi = sorted((self._last_idx, i))
+            for j in range(lo, hi + 1):
+                if not self._entries[j][2]:
+                    self._sel.setdefault(self._entries[j][1])
+        elif path in self._sel:
+            del self._sel[path]
+        else:
+            self._sel[path] = None
+        self._last_idx = i
+        self._update_status()
+        self._schedule_redraw()
+
+    def _on_double(self, e):
+        i = self._index_at(e)
+        if i is None:
+            return
+        _name, path, is_dir = self._entries[i]
+        if is_dir:
+            self._go(path)
+        else:
+            self._sel.setdefault(path)
+            if len(self._sel) == 1:     # nothing else ticked: pick just this one
+                self._accept()
+            else:
+                self._update_status()
+                self._schedule_redraw()
+
+    def _wheel(self, e):
+        up = e.num == 4 or getattr(e, "delta", 0) > 0
+        self.canvas.yview_scroll(-3 if up else 3, "units")
+
+    def _on_return(self, _e):
+        if self.focus_get() is self._path_entry:
+            p = os.path.expanduser(self._path_var.get().strip())
+            if os.path.isdir(p):
+                self._go(p)
+                self.canvas.focus_set()
+            return
+        self._accept()
+
+    def _on_backspace(self, _e):
+        if self.focus_get() is not self._path_entry:
+            self._up()
+
+    def _on_ctrl_a(self, _e):
+        if self.focus_get() is not self._path_entry:
+            self._select_all()
+
+    # ── selection / size ─────────────────────────────────────────────────────
+
+    def _select_all(self):
+        for _n, p, d in self._entries:
+            if not d:
+                self._sel.setdefault(p)
+        self._update_status()
+        self._schedule_redraw()
+
+    def _clear(self):
+        self._sel.clear()
+        self._update_status()
+        self._schedule_redraw()
+
+    def _update_status(self):
+        n = len(self._sel)
+        self._status.config(text=self._tr("tp_selected", n=n) if n else "")
+        self._ok_btn.config(state="normal" if n else "disabled")
+
+    def _mark_size(self):
+        for px, b in self._size_btns.items():
+            b.config(bg=self._col["ACCENT"] if px == self._size
+                     else self._col["BORDER"],
+                     fg="#fff" if px == self._size else self._col["FG"])
+
+    def _set_size(self, px):
+        self._size = px
+        self._mark_size()
+        self._relayout()
+
+    # ── thumbnails (worker thread makes PNG bytes; Tk objects stay on main) ──
+
+    @classmethod
+    def _pil(cls):
+        if cls._pil_mod is False:
+            try:
+                from PIL import Image, ImageOps
+                cls._pil_mod = (Image, ImageOps)
+            except Exception:
+                cls._pil_mod = None
+        return cls._pil_mod
+
+    @staticmethod
+    def _cached_thumb(path: str, size: int):
+        """Path of the desktop's own cached thumbnail (freedesktop spec)."""
+        try:
+            uri = "file://" + quote(os.path.abspath(path), safe="/")
+            name = hashlib.md5(uri.encode("utf-8")).hexdigest() + ".png"
+            base = (os.environ.get("XDG_CACHE_HOME")
+                    or os.path.expanduser("~/.cache"))
+            kinds = (("normal", "large", "x-large", "xx-large") if size <= 128
+                     else ("large", "x-large", "xx-large", "normal"))
+            mtime = os.path.getmtime(path)
+            for k in kinds:
+                p = os.path.join(base, "thumbnails", k, name)
+                if os.path.isfile(p) and os.path.getmtime(p) >= mtime:
+                    return p
+        except OSError:
+            pass
+        return None
+
+    def _make_thumb(self, path: str, size: int):
+        if not os.path.isfile(path):
+            return None
+        cache = self._cached_thumb(path, size)
+        pil = self._pil()
+        if pil:
+            Image, ImageOps = pil
+            cands = ([cache] if cache else [])
+            try:
+                if os.path.getsize(path) <= 128 * 1024 * 1024:
+                    cands.append(path)
+            except OSError:
+                pass
+            for cand in cands:
+                try:
+                    im = Image.open(cand)
+                    try:
+                        im.draft("RGB", (size * 2, size * 2))   # fast JPEG decode
+                    except Exception:
+                        pass
+                    if cand == path:
+                        im = ImageOps.exif_transpose(im)
+                    im.thumbnail((size, size))
+                    if im.mode not in ("L", "LA", "P", "RGB", "RGBA"):
+                        im = im.convert("RGBA")
+                    buf = io.BytesIO()
+                    im.save(buf, "PNG")
+                    return ("png", buf.getvalue())
+                except Exception:
+                    continue
+            return None
+        if cache:
+            with open(cache, "rb") as f:
+                return ("png", f.read())
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext in ("png", "gif") and os.path.getsize(path) <= 1_500_000:
+            return ("file", path)       # Tk can read these natively
+        return None
+
+    def _thumb_worker(self):
+        while True:
+            item = self._reqq.get()
+            if item is None:
+                return
+            gen, path, size = item
+            if gen != self._gen:        # folder changed since it was queued
+                continue
+            try:
+                res = self._make_thumb(path, size)
+            except Exception:
+                res = None
+            self._resq.put((gen, path, size, res))
+
+    def _to_photo(self, res, size):
+        kind, data = res
+        try:
+            if kind == "png":
+                img = tk.PhotoImage(data=base64.b64encode(data).decode("ascii"))
+            else:
+                img = tk.PhotoImage(file=data)
+            f = -(-max(img.width(), img.height()) // size)     # ceil
+            return img.subsample(f) if f > 1 else img
+        except tk.TclError:
+            return None
+
+    def _poll(self):
+        changed = False
+        try:
+            for _ in range(10):
+                gen, path, size, res = self._resq.get_nowait()
+                if gen != self._gen:
+                    continue
+                if len(self._thumbs) > 1500:
+                    self._thumbs.clear()
+                    self._requested.clear()
+                self._thumbs[(path, size)] = self._to_photo(res, size) if res else None
+                changed = True
+        except queue.Empty:
+            pass
+        if changed:
+            self._schedule_redraw()
+        self._poll_job = self.after(40, self._poll)
+
+    # ── finish ───────────────────────────────────────────────────────────────
+
+    def _accept(self):
+        if self._sel:
+            self.result = list(self._sel)
+            self._close()
+
+    def _cancel(self):
+        self.result = []
+        self._close()
+
+    def _close(self):
+        for attr in ("_redraw_job", "_poll_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._reqq.put(None)
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+    def show(self):
+        try:
+            self.deiconify()
+            try:
+                self.wait_visibility()
+                self.grab_set()
+            except tk.TclError:
+                pass
+            self.canvas.focus_set()
+            self.wait_window(self)
+        finally:
+            try:
+                if self.winfo_exists():
+                    self._close()
+            except tk.TclError:
+                pass
+        return self.result
+
+
 # ── Application ────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -937,7 +1675,17 @@ class App(tk.Tk):
         self.minsize(720, 500)
         self.resizable(True, True)
 
-        self.folder_var    = tk.StringVar(value=self.settings.get("last_folder", ""))
+        # Previously used folders / file picks (dropdown), newest first. The
+        # most recent one is what gets resumed at startup.
+        self._history = self._load_history()
+        self._source = None
+        if self._history:
+            self._source = self._history[0]
+        elif self.settings.get("last_folder", ""):
+            self._source = make_source("folder", [self.settings.get("last_folder")])
+        self._dialog_open = False
+        self._shown_label = self._source_label(self._source) if self._source else ""
+        self.folder_var    = tk.StringVar(value=self._shown_label)
         self.recursive_var = tk.BooleanVar(value=self.settings.get_bool("recursive", False))
 
         # Scan state — all parallel lists indexed by row
@@ -983,8 +1731,7 @@ class App(tk.Tk):
 
         # 3) Resume the previously used folder (read from the .ini). The loading
         #    screen goes away when that scan is done.
-        last = self.folder_var.get().strip()
-        if last and os.path.isdir(last):
+        if source_valid(self._source):
             self._scan()
         else:
             self._end_boot()
@@ -1009,7 +1756,9 @@ class App(tk.Tk):
         self._cancel_after("_boot_job")
         self._stop_spinner()
         self._flush_unchecked()
-        self.settings.set("last_folder", self.folder_var.get().strip())
+        src = self._resolve_source()
+        if src and src["kind"] == "folder":
+            self.settings.set("last_folder", src["paths"][0])
         self.destroy()
         _cleanup_pycache()
 
@@ -1095,6 +1844,25 @@ class App(tk.Tk):
         style.configure("TProgressbar",
                         troughcolor=BORDER, background=GREEN,
                         borderwidth=0, thickness=6)
+        ENTRY_BG = self._c("ENTRY_BG")
+        style.configure("Z.TCombobox",
+                        fieldbackground=ENTRY_BG, background=BORDER,
+                        foreground=FG, arrowcolor=MUTED,
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                        insertcolor=ACCENT, padding=6)
+        style.map("Z.TCombobox",
+                  fieldbackground=[("readonly", ENTRY_BG)],
+                  foreground=[("readonly", FG)],
+                  background=[("active", BORDER), ("pressed", BORDER)],
+                  arrowcolor=[("active", ACCENT)],
+                  selectbackground=[("!focus", ENTRY_BG)],
+                  selectforeground=[("!focus", FG)])
+        # The dropdown list itself is a plain Tk listbox -> themed via options.
+        self.option_add("*TCombobox*Listbox.background", ENTRY_BG)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", self._c("SEL_BG"))
+        self.option_add("*TCombobox*Listbox.selectForeground", FG)
+        self.option_add("*TCombobox*Listbox.font", ("Consolas", 10))
 
         # ── Header ────────────────────────────────────────────────────────────
         hdr = tk.Frame(self, bg=BG, pady=20)
@@ -1134,20 +1902,27 @@ class App(tk.Tk):
         self.folder_label_lbl.pack(anchor="w", padx=14, pady=(10, 2))
         row = tk.Frame(picker, bg=CARD)
         row.pack(fill="x", padx=14, pady=(0, 12))
-        self.path_entry = tk.Entry(row, textvariable=self.folder_var,
-                                   font=("Consolas", 10), bg=self._c("ENTRY_BG"),
-                                   fg=FG, insertbackground=ACCENT,
-                                   relief="flat", bd=8,
-                                   highlightthickness=1,
-                                   highlightbackground=BORDER,
-                                   highlightcolor=ACCENT)
-        self.path_entry.pack(side="left", fill="x", expand=True, ipady=6)
-        self.browse_btn = tk.Button(row, text=self._t("browse"), command=self._browse,
-                  font=("Segoe UI", 9, "bold"),
-                  bg=BORDER, fg=FG, activebackground=ACCENT,
-                  activeforeground="#fff", relief="flat",
-                  padx=16, pady=6, cursor="hand2", bd=0)
-        self.browse_btn.pack(side="left", padx=(8, 0))
+        # Editable dropdown: type/paste a path, or pick a previously used
+        # folder / file selection (remembered in the .ini).
+        self.path_combo = ttk.Combobox(
+            row, textvariable=self.folder_var, style="Z.TCombobox",
+            font=("Consolas", 10),
+            values=[self._source_label(h) for h in self._history])
+        self.path_combo.pack(side="left", fill="x", expand=True, ipady=4)
+        self.path_combo.bind("<<ComboboxSelected>>", self._on_history_pick)
+        self.path_combo.bind("<Return>", lambda _e: self._scan())
+        btn_kw = dict(font=("Segoe UI", 9, "bold"),
+                      bg=BORDER, fg=FG, activebackground=ACCENT,
+                      activeforeground="#fff", relief="flat",
+                      padx=14, pady=6, cursor="hand2", bd=0)
+        self.browse_folder_btn = tk.Button(
+            row, text=self._t("browse_folder"),
+            command=lambda: self._pick("folder"), **btn_kw)
+        self.browse_folder_btn.pack(side="left", padx=(8, 0))
+        self.browse_files_btn = tk.Button(
+            row, text=self._t("browse_files"),
+            command=lambda: self._pick("files"), **btn_kw)
+        self.browse_files_btn.pack(side="left", padx=(6, 0))
         opt_row = tk.Frame(picker, bg=CARD)
         opt_row.pack(fill="x", padx=14, pady=(0, 12))
         self.recursive_chk = ttk.Checkbutton(opt_row,
@@ -1336,6 +2111,9 @@ class App(tk.Tk):
         self._row_ids = []
         self.configure(bg=self._c("BG"))
         self._build_ui()
+        # A multi-file label contains translated text -> regenerate it.
+        if self._source and self.folder_var.get() == self._shown_label:
+            self._show_source()
 
         # Restore preview rows (theme/language change shouldn't lose a scan)
         if preview_snapshot:
@@ -1371,16 +2149,151 @@ class App(tk.Tk):
             if self._scan_active:
                 self.cancel_btn.pack(side="left", padx=(10, 0))
 
-    # ── Browse ─────────────────────────────────────────────────────────────────
+    # ── Source (folder / picked files) + history ───────────────────────────────
 
-    def _browse(self):
-        folder = filedialog.askdirectory(title=self._t("select_folder_title"))
-        if folder:
-            self.folder_var.set(folder)
-            self.settings.set("last_folder", folder)
+    def _source_label(self, src: dict) -> str:
+        """Text shown in the dropdown. A folder or a single file is just its
+        path (so it can be edited/copied); a multi-file pick is summarised."""
+        paths = src["paths"]
+        if src["kind"] == "folder" or len(paths) == 1:
+            return paths[0]
+        names = ", ".join(os.path.basename(p) for p in paths[:3])
+        more = ", …" if len(paths) > 3 else ""
+        return (f"[{self._t('files_n', n=len(paths))}]  "
+                f"{source_dir(src)}{os.sep}  ›  {names}{more}")
+
+    def _show_source(self):
+        self._shown_label = self._source_label(self._source)
+        self.folder_var.set(self._shown_label)
+
+    def _resolve_source(self):
+        """What the dropdown currently means: the remembered source it shows,
+        or whatever folder / file path was typed or pasted. None if invalid."""
+        text = self.folder_var.get().strip()
+        if self._source and text == self._shown_label:
+            return self._source
+        text = text.strip('"').strip("'")
+        if not text:
+            return None
+        p = os.path.expanduser(text)
+        if os.path.isdir(p):
+            return make_source("folder", [p])
+        if os.path.isfile(p):
+            return make_source("files", [p])
+        return None
+
+    def _load_history(self) -> list:
+        try:
+            data = json.loads(self.settings.get("history", "[]") or "[]")
+        except Exception:
+            return []
+        out = []
+        for d in data if isinstance(data, list) else []:
+            if (isinstance(d, dict) and d.get("kind") in ("folder", "files")
+                    and isinstance(d.get("paths"), list)):
+                paths = [p for p in d["paths"] if isinstance(p, str) and p]
+                if paths:
+                    out.append({"kind": d["kind"], "paths": paths})
+        return out[:HISTORY_MAX]
+
+    def _remember(self, src: dict):
+        """Put a source at the top of the history (de-duplicated) -> .ini."""
+        if len(src["paths"]) > HISTORY_MAX_PATHS:
+            return
+        key = source_key(src)
+        self._history = [h for h in self._history if source_key(h) != key]
+        self._history.insert(0, src)
+        del self._history[HISTORY_MAX:]
+        self.settings.set("history", json.dumps(self._history, ensure_ascii=False))
+        try:
+            self.path_combo["values"] = [self._source_label(h) for h in self._history]
+        except tk.TclError:
+            pass
+
+    def _on_history_pick(self, _event=None):
+        i = self.path_combo.current()
+        if 0 <= i < len(self._history):
+            self._source = self._history[i]
+            self._show_source()
             self._scan()
 
+    # ── Browse: one button for a folder, one for files ───────────────────────
 
+    def _start_dir(self) -> str:
+        """Where the chooser opens: the current / last used location."""
+        cands = []
+        cur = self._resolve_source()
+        if cur:
+            cands.append(source_dir(cur))
+        cands += [source_dir(h) for h in self._history]
+        for c in cands:
+            while c and not os.path.isdir(c):
+                parent = os.path.dirname(c)
+                if parent == c:
+                    break
+                c = parent
+            if c and os.path.isdir(c):
+                return c
+        return os.path.expanduser("~")
+
+    def _pick(self, kind: str):
+        if self._dialog_open:
+            return
+        title = self._t("select_folder_title" if kind == "folder"
+                        else "select_files_title")
+        start = self._start_dir()
+        self._dialog_open = True
+        if kind == "files" and PLATFORM.startswith("linux"):
+            # Built-in thumbnail-grid browser instead of a list/tree dialog.
+            recent = []
+            for h in self._history:
+                d = source_dir(h)
+                if d not in recent and os.path.isdir(d):
+                    recent.append(d)
+            try:
+                res = ThumbPicker(self, title, start, recent[:8],
+                                  THEMES.get(self.theme, THEMES["dark"]),
+                                  self._t).show()
+            except Exception:
+                res = None              # fall through to the desktop's chooser
+            if res is not None:
+                self._pick_done(kind, title, start, res)
+                return
+        if PLATFORM.startswith("linux"):
+            # The desktop's own chooser runs as a separate process; wait for
+            # it off the UI thread so the window stays responsive.
+            def worker():
+                try:
+                    res = native_linux_dialog(kind, title, start)
+                except Exception:
+                    res = None
+                try:
+                    self.after(0, self._pick_done, kind, title, start, res)
+                except Exception:
+                    pass                # window was closed meanwhile
+            threading.Thread(target=worker, daemon=True).start()
+        else:
+            self._pick_done(kind, title, start, None)
+
+    def _pick_done(self, kind: str, title: str, start: str, res):
+        try:
+            if res is None:
+                # Windows / macOS (native Tk dialogs) or no kdialog/zenity on Linux
+                if kind == "folder":
+                    p = filedialog.askdirectory(title=title, initialdir=start)
+                    res = [p] if p else []
+                else:
+                    res = filedialog.askopenfilenames(title=title, initialdir=start)
+                    if isinstance(res, str):
+                        res = self.tk.splitlist(res)
+                    res = list(res)
+        finally:
+            self._dialog_open = False
+        if not res:
+            return
+        self._source = make_source(kind, res)
+        self._show_source()
+        self._scan()
 
     # ── Checkbox helpers ───────────────────────────────────────────────────────
 
@@ -1540,12 +2453,17 @@ class App(tk.Tk):
     # ── Scan ───────────────────────────────────────────────────────────────────
 
     def _scan(self):
-        folder = self.folder_var.get().strip()
-        if not folder or not os.path.isdir(folder):
+        src = self._resolve_source()
+        if not source_valid(src):
             messagebox.showwarning(self._t("no_folder_title"), self._t("no_folder_msg"))
             return
 
-        self.settings.set("last_folder", folder)
+        self._source = src
+        self._show_source()
+        self._remember(src)
+        folder = source_dir(src)
+        if src["kind"] == "folder":
+            self.settings.set("last_folder", folder)
         self._scan_folder = folder
 
         # Reset all state
@@ -1572,14 +2490,19 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._scan_worker,
-            args=(folder, self.recursive_var.get()),
+            args=(src, self.recursive_var.get()),
             daemon=True
         ).start()
         self.after(self._POLL_MS, self._poll_scan_queue)
 
-    def _scan_worker(self, folder: str, recursive: bool):
+    def _scan_worker(self, src: dict, recursive: bool):
         try:
-            scan_folder(folder, recursive, self._cancel_event, self._scan_queue)
+            if src["kind"] == "files":
+                scan_folder(None, False, self._cancel_event, self._scan_queue,
+                            picked_files=src["paths"])
+            else:
+                scan_folder(src["paths"][0], recursive,
+                            self._cancel_event, self._scan_queue)
         except Exception as e:
             self._scan_queue.put(("__error__", str(e)))
             self._scan_queue.put(None)
