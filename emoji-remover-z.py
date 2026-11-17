@@ -240,6 +240,7 @@ TRANSLATIONS = {
         "select_folder_title": "Select folder",
         "select_files_title": "Select files",
         "files_n": "{n} files",
+        "clear_recent": "🗑  Clear recent",
         "tp_places": "PLACES",
         "tp_recent": "RECENT",
         "tp_home": "Home",
@@ -317,6 +318,7 @@ TRANSLATIONS = {
         "select_folder_title": "Selecionar pasta",
         "select_files_title": "Selecionar arquivos",
         "files_n": "{n} arquivos",
+        "clear_recent": "🗑  Limpar recentes",
         "tp_places": "LOCAIS",
         "tp_recent": "RECENTES",
         "tp_home": "Pasta pessoal",
@@ -1907,7 +1909,7 @@ class App(tk.Tk):
         self.path_combo = ttk.Combobox(
             row, textvariable=self.folder_var, style="Z.TCombobox",
             font=("Consolas", 10),
-            values=[self._source_label(h) for h in self._history])
+            values=self._combo_values())
         self.path_combo.pack(side="left", fill="x", expand=True, ipady=4)
         self.path_combo.bind("<<ComboboxSelected>>", self._on_history_pick)
         self.path_combo.bind("<Return>", lambda _e: self._scan())
@@ -2206,12 +2208,31 @@ class App(tk.Tk):
         del self._history[HISTORY_MAX:]
         self.settings.set("history", json.dumps(self._history, ensure_ascii=False))
         try:
-            self.path_combo["values"] = [self._source_label(h) for h in self._history]
+            self.path_combo["values"] = self._combo_values()
         except tk.TclError:
             pass
 
+    def _combo_values(self) -> list:
+        """Dropdown rows: every remembered location, then "Clear recent"."""
+        if not self._history:
+            return []
+        return [self._source_label(h) for h in self._history] + [self._t("clear_recent")]
+
+    def _clear_history(self):
+        """Forget every remembered location (dropdown + .ini + startup resume)."""
+        self._history = []
+        self.settings.set("history", "[]")
+        self.settings.set("last_folder", "")
+        self._source = None
+        self._shown_label = ""
+        self.folder_var.set("")
+        self.path_combo["values"] = self._combo_values()
+
     def _on_history_pick(self, _event=None):
         i = self.path_combo.current()
+        if self._history and i == len(self._history):      # the "Clear recent" row
+            self._clear_history()
+            return
         if 0 <= i < len(self._history):
             self._source = self._history[i]
             self._show_source()
