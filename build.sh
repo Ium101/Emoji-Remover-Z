@@ -100,7 +100,7 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
         # but this is the less reliable path.
         XDG_DESKTOP="$HOME/Desktop"
     fi
-    DESKTOP_SHORTCUT="$XDG_DESKTOP/emoji-remover-z.desktop"
+    DESKTOP_SHORTCUT="$XDG_DESKTOP/Emoji Remover Z.desktop"
     mkdir -p "$DESKTOP_DIR" "$XDG_DESKTOP"
 
     # Broad search-and-destroy pass: an older revision of this script may
@@ -124,7 +124,7 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     # Write .desktop file for app menu — Exec points straight at the .py
     # file (executable via its shebang), not at a compiled binary. The path
     # is quoted in case it contains spaces.
-    cat > "$DESKTOP_DIR/emoji-remover-z.desktop" << EOF
+    cat > "$DESKTOP_DIR/Emoji Remover Z.desktop" << EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -140,7 +140,7 @@ StartupNotify=true
 StartupWMClass=Emoji_Remover_Z
 EOF
 
-    chmod +x "$DESKTOP_DIR/emoji-remover-z.desktop"
+    chmod +x "$DESKTOP_DIR/Emoji Remover Z.desktop"
 
     # Write Desktop shortcut directly (not a copy — independent file)
     cat > "$DESKTOP_SHORTCUT" << EOF
@@ -165,7 +165,7 @@ EOF
     # output whether the fix took — rather than trusting it silently.
     echo
     echo "  Verifying Exec lines actually point at the .py file:"
-    grep -H '^Exec=' "$DESKTOP_DIR/emoji-remover-z.desktop" "$DESKTOP_SHORTCUT" | sed 's/^/    /'
+    grep -H '^Exec=' "$DESKTOP_DIR/Emoji Remover Z.desktop" "$DESKTOP_SHORTCUT" | sed 's/^/    /'
 
     # Mark trusted so GNOME/Nautilus shows it as a launcher, not a text file.
     # gio set with a quoted "true" string is required on GNOME 40+; bare `true`
@@ -192,14 +192,14 @@ EOF
     # Try to pin to GNOME sidebar
     if command -v gsettings &>/dev/null; then
         CURRENT_FAVORITES=$(gsettings get org.gnome.shell favorite-apps 2>/dev/null || echo "[]")
-        APP_ID="emoji-remover-z.desktop"
+        APP_ID="Emoji Remover Z.desktop"
         if [[ "$CURRENT_FAVORITES" != *"$APP_ID"* ]]; then
             NEW_FAVORITES="$(echo "$CURRENT_FAVORITES" | sed "s/]/, '$APP_ID']/;s/\[\s*,/[/")"
             gsettings set org.gnome.shell favorite-apps "$NEW_FAVORITES" 2>/dev/null || true
         fi
     fi
 
-    echo "  App menu entry:   $DESKTOP_DIR/emoji-remover-z.desktop"
+    echo "  App menu entry:   $DESKTOP_DIR/Emoji Remover Z.desktop"
     echo "  Desktop shortcut: $DESKTOP_SHORTCUT"
     echo "  Icon:             $ICON_HICOLOR/emoji-remover-z.png"
     echo
