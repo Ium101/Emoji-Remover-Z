@@ -431,14 +431,26 @@ _STYLED_TO_ASCII.update({
     'ℭ':'C','ℯ':'e','ℰ':'E','ℱ':'F','ℳ':'M','ℴ':'o',
 })
 
-# Parenthesis / brace look-alikes (e.g. U+2768/2769, U+207D/207E, U+FE59/FE5A,
-# U+2985/2986) are deliberately NOT converted or flagged: Windows doesn't treat
-# them as problems, so neither does this app. Fullwidth parentheses/braces
-# (U+FF08/FF09, U+FF5B/FF5D, U+FF5F/FF60) are also excluded from the fullwidth
-# block below for the same reason.
-_STYLED_KEEP = frozenset('\uFF08\uFF09\uFF3B\uFF3D\uFF5B\uFF5D\uFF5F\uFF60')
-for _ch in _STYLED_KEEP:
-    _STYLED_TO_ASCII.pop(_ch, None)
+# Fullwidth and CJK brackets are converted to their plain ASCII equivalents, so
+# a name like  マーリンちゃん（落第賢者）【R-18】  is flagged and becomes
+# マーリンちゃん(落第賢者)[R-18]  (the Japanese text itself is never touched).
+# Edit this table to change how a particular bracket is converted.
+_BRACKET_TO_ASCII = {
+    '\uFF08': '(', '\uFF09': ')',            # （ ）  fullwidth parentheses
+    '\uFF3B': '[', '\uFF3D': ']',            # ［ ］  fullwidth square brackets
+    '\uFF5B': '{', '\uFF5D': '}',            # ｛ ｝  fullwidth braces
+    '\uFF5F': '(', '\uFF60': ')',            # ｟ ｠  fullwidth white parentheses
+    '\u3010': '[', '\u3011': ']',            # 【 】  black lenticular brackets
+    '\u3016': '[', '\u3017': ']',            # 〖 〗  white lenticular brackets
+    '\u3014': '[', '\u3015': ']',            # 〔 〕  tortoise shell brackets
+    '\u3018': '[', '\u3019': ']',            # 〘 〙  white tortoise shell brackets
+    '\u301A': '[', '\u301B': ']',            # 〚 〛  white square brackets
+    '\u300C': '[', '\u300D': ']',            # 「 」  corner brackets
+    '\u300E': '[', '\u300F': ']',            # 『 』  white corner brackets
+    '\u3008': '(', '\u3009': ')',            # 〈 〉  angle brackets
+    '\u300A': '(', '\u300B': ')',            # 《 》  double angle brackets
+}
+_STYLED_TO_ASCII.update(_BRACKET_TO_ASCII)
 
 
 def normalize_styled(name: str) -> tuple[str, bool]:
@@ -1649,6 +1661,33 @@ class ThumbPicker(tk.Toplevel):
         return self.result
 
 
+# ── Window / taskbar icon ──────────────────────────────────────────────────────
+
+def _apply_window_icon(window) -> None:
+    """Use emoji_remover_z.png (next to this script) as the window icon.
+    Silently does nothing if the file is missing or can't be loaded."""
+    try:
+        png = _app_dir() / "emoji_remover_z.png"
+        if png.is_file():
+            window._app_icon = tk.PhotoImage(file=str(png))   # keep a reference
+            window.iconphoto(True, window._app_icon)
+    except Exception:
+        pass
+
+
+def _set_windows_app_id() -> None:
+    """Give the process its own taskbar identity on Windows, so the taskbar
+    shows this app's icon instead of grouping it under python.exe."""
+    if PLATFORM != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Ium101.EmojiRemoverZ")
+    except Exception:
+        pass
+
+
 # ── Application ────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -1673,6 +1712,7 @@ class App(tk.Tk):
             self.theme = "dark"
 
         self.title("Emoji Remover Z")
+        _apply_window_icon(self)
         self.geometry("960x690")
         self.minsize(720, 500)
         self.resizable(True, True)
@@ -2943,5 +2983,6 @@ if __name__ == "__main__":
         _inspect_folder(sys.argv[_i + 1] if len(sys.argv) > _i + 1 else ".")
         sys.exit(0)
     atexit.register(_cleanup_pycache)
+    _set_windows_app_id()
     app = App()
     app.mainloop()

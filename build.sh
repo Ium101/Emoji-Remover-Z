@@ -71,11 +71,11 @@ echo
 # terminal can both launch it as "./emoji-remover-z.py" from here on.
 chmod +x "$APP_PY"
 
-# Copy icon for the Linux app menu, then remove the loose source PNG.
+# Copy icon for the Linux app menu. The PNG itself stays next to the script:
+# the app loads it as its own window icon.
 ICON_HICOLOR="$HOME/.local/share/icons/hicolor/256x256/apps"
 mkdir -p "$ICON_HICOLOR"
 cp "$SCRIPT_DIR/emoji_remover_z.png" "$ICON_HICOLOR/emoji-remover-z.png"
-rm -f "$SCRIPT_DIR/emoji_remover_z.png"
 
 echo "[5/5] Installing shortcuts and app entry..."
 echo
